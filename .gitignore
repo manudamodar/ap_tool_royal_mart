@@ -28,4 +28,3 @@ yarn-error.log*
 # --- Virtual Environments ---
 venv/
 env/
-/saswatfinenv/
