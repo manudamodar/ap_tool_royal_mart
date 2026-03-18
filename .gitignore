@@ -1,31 +1,31 @@
+# --- Python / Django Essentials ---
 db.sqlite3
-
+.env
 /logs/
+/media/
+/staticfiles/
+__pycache__/
+*.py[cod]
+*$py.class
+**/.idea/
+**/.vscode/
 
-/__pycache__
-/data_entry_app/migrations/__pycache__
-/saswat_cust_app/migrations/__pycache__
-/saswat_cust_info/__pycache__
-/data_entry_app/__pycache__
-/saswat_cust_app/__pycache__
-/pre_sanction_app/__pycache__
-/dms/__pycache__
-**/__pycache__/
-/.idea
-
-
-#!/data_entry_app/migrations/
-#!/saswat_cust_app/migrations/
-
-# Ignore all files inside any migration folders
-**/migrations/*
-
-# Do not ignore the migration folders themselves
-!**/migrations/
-
-# Except do not ignore the __init__.py files in any migration folder
+# --- Django Migrations (Your specific request) ---
+# This ignores all migration files but keeps the folders and __init__.py
+**/migrations/*.py
 !**/migrations/__init__.py
 
-/media/
-/.env
+# --- Frontend (The source of your 37k files) ---
+# This will fix the slow VCS adding issue
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+frontend/.env
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
+# --- Virtual Environments ---
+venv/
+env/
+/saswatfinenv/
