@@ -1,0 +1,31 @@
+db.sqlite3
+
+/logs/
+
+/__pycache__
+/data_entry_app/migrations/__pycache__
+/saswat_cust_app/migrations/__pycache__
+/saswat_cust_info/__pycache__
+/data_entry_app/__pycache__
+/saswat_cust_app/__pycache__
+/pre_sanction_app/__pycache__
+/dms/__pycache__
+**/__pycache__/
+/.idea
+
+
+#!/data_entry_app/migrations/
+#!/saswat_cust_app/migrations/
+
+# Ignore all files inside any migration folders
+**/migrations/*
+
+# Do not ignore the migration folders themselves
+!**/migrations/
+
+# Except do not ignore the __init__.py files in any migration folder
+!**/migrations/__init__.py
+
+/media/
+/.env
+
