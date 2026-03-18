@@ -1,5 +1,7 @@
 import msal
 import logging
+import requests
+import base64
 from django.conf import settings
 from django.shortcuts import redirect
 from django.http import JsonResponse
@@ -44,6 +46,27 @@ def msal_callback(request):
         logger.error(f"MSAL token acquisition error: {result.get('error_description')}")
         return JsonResponse({"error": result.get("error_description")}, status=400)
 
+    # Now that we have an access token, fetch the user's photo using Graph API
+    access_token = result.get('access_token')
+    photo_data = None
+    if access_token:
+        try:
+            logger.info("Attempting to fetch user photo from Microsoft Graph API.")
+            headers = {'Authorization': f'Bearer {access_token}'}
+            photo_response = requests.get('https://graph.microsoft.com/v1.0/me/photo/$value', headers=headers)
+            
+            if photo_response.status_code == 200:
+                # Convert the raw image bytes to a base64 string for easy storage and frontend rendering
+                image_bytes = photo_response.content
+                content_type = photo_response.headers.get('Content-Type', 'image/jpeg')
+                base64_encoded = base64.b64encode(image_bytes).decode('utf-8')
+                photo_data = f"data:{content_type};base64,{base64_encoded}"
+                logger.info("Successfully fetched and encoded user photo.")
+            else:
+                logger.warning(f"Could not fetch photo. Status code: {photo_response.status_code}")
+        except Exception as e:
+            logger.error(f"Error fetching photo from Graph API: {e}")
+
     user_info = result.get('id_token_claims', {})
     logger.info(f"User info from MSAL: {user_info}")
     
@@ -63,9 +86,18 @@ def msal_callback(request):
     profile, profile_created = UserProfile.objects.get_or_create(user=user)
     logger.info(f"UserProfile {'created' if profile_created else 'retrieved'} for user {user.username}. Role is {profile.role}.")
 
-    # No explicit role assignment here; it will use the model's default (UNASSIGNED)
-    
-    profile.msal_data = user_info
+    # Update MSAL data and photo.
+    # We update the msal_data dictionary but we preserve the old MSAL data and just update it
+    # so we don't lose information if MSAL gives less info next time.
+    if profile.msal_data:
+        updated_data = profile.msal_data.copy()
+        updated_data.update(user_info)
+        profile.msal_data = updated_data
+    else:
+        profile.msal_data = user_info
+
+    if photo_data:
+        profile.profile_photo = photo_data
     profile.save()
     logger.info(f"UserProfile for {user.username} saved successfully.")
 
@@ -85,10 +117,11 @@ def get_user_info(request):
             profile = UserProfile.objects.get(user=request.user)
             role = profile.role
             msal_data = profile.msal_data
+            photo = profile.profile_photo
         except UserProfile.DoesNotExist:
-            # If for some reason a UserProfile doesn't exist, default to UNASSIGNED
             role = UserRole.UNASSIGNED
             msal_data = {}
+            photo = None
             
         return JsonResponse({
             "authenticated": True,
@@ -97,6 +130,7 @@ def get_user_info(request):
             "email": request.user.email,
             "first_name": request.user.first_name,
             "msal_data": msal_data,
+            "photo": photo,
         })
     else:
         return JsonResponse({"authenticated": False})

@@ -20,9 +20,12 @@ const Navbar = ({ user, onLogout }) => {
 
   const msalData = user?.msal_data || {};
 
-  // Use UI-Avatars to generate a profile picture from their name, as MSAL claims don't include the photo directly
-  const displayName = user?.first_name || user?.username || "User";
-  const profileImage = `https://ui-avatars.com/api/?name=${encodeURIComponent(displayName)}&background=f0f2f5&color=E31837&size=128&font-size=0.4&bold=true`;
+  const displayName = user?.first_name || msalData.name || user?.username || "User";
+  const email = user?.email || msalData.preferred_username || "N/A";
+  const phoneNumber = msalData.mobilePhone || msalData.phoneNumber || msalData.mobile || "Not provided";
+
+  // Use the real photo from the backend if it exists, otherwise fall back to the UI-Avatar
+  const profileImage = user?.photo || `https://ui-avatars.com/api/?name=${encodeURIComponent(displayName)}&background=f0f2f5&color=E31837&size=128&font-size=0.4&bold=true`;
 
   return (
     <nav style={{
@@ -68,7 +71,7 @@ const Navbar = ({ user, onLogout }) => {
 
             <img
               src={profileImage}
-              alt="Profile"
+              alt="Profile Avatar"
               style={{
                 width: '38px',
                 height: '38px',
@@ -89,12 +92,11 @@ const Navbar = ({ user, onLogout }) => {
               backgroundColor: 'white',
               borderRadius: '8px',
               boxShadow: '0 8px 24px rgba(0,0,0,0.2)',
-              width: '320px',
+              width: '300px',
               color: '#333',
               overflow: 'hidden',
               display: 'flex',
-              flexDirection: 'column',
-              maxHeight: '80vh' // Keep it within screen
+              flexDirection: 'column'
             }}>
               {/* Header inside popup */}
               <div style={{
@@ -108,7 +110,7 @@ const Navbar = ({ user, onLogout }) => {
               }}>
                 <img
                   src={profileImage}
-                  alt="Large Profile"
+                  alt="Large Profile Avatar"
                   style={{
                     width: '80px',
                     height: '80px',
@@ -121,9 +123,6 @@ const Navbar = ({ user, onLogout }) => {
                   <h3 style={{ margin: 0, fontSize: '18px', color: '#111', fontWeight: 'bold' }}>
                     {displayName}
                   </h3>
-                  <p style={{ margin: '4px 0 0 0', fontSize: '14px', color: '#666' }}>
-                    {user.email}
-                  </p>
                   <span style={{
                     display: 'inline-block',
                     marginTop: '8px',
@@ -140,40 +139,27 @@ const Navbar = ({ user, onLogout }) => {
                 </div>
               </div>
 
-              {/* Dynamic MSAL Details Section */}
-              <div style={{ padding: '0', overflowY: 'auto', flex: 1 }}>
-                <div style={{ padding: '16px 20px', borderBottom: '1px solid #eee', backgroundColor: '#fff' }}>
-                  <h4 style={{ margin: '0 0 12px 0', fontSize: '13px', color: '#999', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                    Authentication Details
-                  </h4>
+              {/* Specific User Details Section */}
+              <div style={{ padding: '20px', backgroundColor: '#fff' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
 
-                  {/* Map over MSAL data and display all string/number details */}
-                  {Object.keys(msalData).length > 0 ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                      {Object.entries(msalData).map(([key, value]) => {
-                        // Skip long tokens, internal hashes, or objects to keep the UI clean
-                        if (typeof value !== 'string' && typeof value !== 'number') return null;
-                        if (['aio', 'rh', 'uti', 'nonce', 'c_hash'].includes(key)) return null;
+                  {/* Email */}
+                  <div style={{ display: 'flex', flexDirection: 'column' }}>
+                    <span style={{ fontSize: '12px', color: '#888', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Email Address</span>
+                    <span style={{ fontSize: '14px', color: '#222', marginTop: '4px' }}>{email}</span>
+                  </div>
 
-                        // Format the key to be more readable (e.g. preferred_username -> Preferred Username)
-                        const formattedKey = key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ').replace(/^./, str => str.toUpperCase());
+                  {/* Mobile Number */}
+                  <div style={{ display: 'flex', flexDirection: 'column' }}>
+                    <span style={{ fontSize: '12px', color: '#888', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Mobile Number</span>
+                    <span style={{ fontSize: '14px', color: '#222', marginTop: '4px' }}>{phoneNumber}</span>
+                  </div>
 
-                        return (
-                          <div key={key} style={{ display: 'flex', flexDirection: 'column' }}>
-                            <span style={{ fontSize: '12px', color: '#777', fontWeight: '600' }}>{formattedKey}</span>
-                            <span style={{ fontSize: '14px', color: '#222', wordBreak: 'break-all' }}>{value || 'N/A'}</span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <p style={{ fontSize: '13px', color: '#888', margin: 0 }}>No additional directory data available.</p>
-                  )}
                 </div>
               </div>
 
               {/* Logout Button */}
-              <div style={{ padding: '16px 20px', backgroundColor: '#fafafa' }}>
+              <div style={{ padding: '16px 20px', backgroundColor: '#fafafa', borderTop: '1px solid #eee' }}>
                 <button
                   onClick={onLogout}
                   style={{

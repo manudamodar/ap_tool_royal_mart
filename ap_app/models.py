@@ -13,6 +13,9 @@ class UserProfile(models.Model):
     
     # Store the full claims payload from MSAL if needed for reference
     msal_data = models.JSONField(null=True, blank=True)
+    
+    # Store the user's profile photo as a base64 string
+    profile_photo = models.TextField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.user.username} - {self.role}"
