@@ -1,3 +1,40 @@
+/* Light Theme (Default) */
+:root {
+  --background-primary: #FFFFFF;
+  --background-secondary: #f0f2f5;
+  --text-primary: #1c1e21;
+  --text-secondary: #65676b;
+  --primary-accent: #E31837;
+  --primary-accent-hover: #c9142d;
+  --card-background: #FFFFFF;
+  --card-border: #e0e0e0;
+  --navbar-background: #FFFFFF;
+  --navbar-text: #1c1e21;
+  --button-background: #E31837;
+  --button-text: #FFFFFF;
+  --button-hover-background: #c9142d;
+  --shadow-color: rgba(0, 0, 0, 0.1);
+}
+
+/* Dark Theme */
+body.dark-theme {
+  --background-primary: #18191a;
+  --background-secondary: #242526;
+  --text-primary: #e4e6eb;
+  --text-secondary: #b0b3b8;
+  --primary-accent: #FF6B6B;
+  --primary-accent-hover: #FF8787;
+  --card-background: #242526;
+  --card-border: #3a3b3c;
+  --navbar-background: #242526;
+  --navbar-text: #e4e6eb;
+  --button-background: #FF6B6B;
+  --button-text: #18191a;
+  --button-hover-background: #FF8787;
+  --shadow-color: rgba(255, 255, 255, 0.1);
+}
+
+
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
@@ -5,6 +42,9 @@ body {
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  background-color: var(--background-secondary);
+  color: var(--text-primary);
+  transition: background-color 0.3s, color 0.3s;
 }
 
 code {
@@ -13,14 +53,14 @@ code {
 }
 
 nav {
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-  background: white !important;
-  border-bottom: 1px solid #eaeaea;
+  box-shadow: 0 2px 4px var(--shadow-color);
+  background: var(--navbar-background) !important; /* important to override inline style */
+  border-bottom: 1px solid var(--card-border);
 }
 
 button {
-  background-color: #0078D4; /* Microsoft Blue */
-  color: white;
+  background-color: var(--button-background);
+  color: var(--button-text);
   border: none;
   padding: 8px 16px;
   border-radius: 4px;
@@ -31,9 +71,9 @@ button {
 }
 
 button:hover {
-  background-color: #005a9e;
+  background-color: var(--button-hover-background);
 }
 
-h2, h3 {
-  color: #333;
+h1, h2, h3, h4, h5, h6 {
+  color: var(--text-primary);
 }

@@ -23,7 +23,8 @@ def msal_login(request):
     msal_app = get_msal_app()
     auth_url = msal_app.get_authorization_request_url(
         settings.MSAL_SCOPES,
-        redirect_uri=settings.MSAL_REDIRECT_URI
+        redirect_uri=settings.MSAL_REDIRECT_URI,
+        prompt="select_account"
     )
     return redirect(auth_url)
 
@@ -109,7 +110,10 @@ def msal_callback(request):
 @csrf_exempt
 def msal_logout(request):
     logout(request)
-    return JsonResponse({"status": "logged_out"})
+    authority = settings.MSAL_AUTHORITY
+    post_logout_redirect_uri = request.build_absolute_uri('/')
+    logout_url = f"{authority}/oauth2/v2.0/logout?post_logout_redirect_uri={post_logout_redirect_uri}"
+    return JsonResponse({"status": "logged_out", "logout_url": logout_url})
 
 def get_user_info(request):
     if request.user.is_authenticated:
@@ -134,3 +138,89 @@ def get_user_info(request):
         })
     else:
         return JsonResponse({"authenticated": False})
+
+@csrf_exempt
+def get_bills(request):
+    if request.method == 'GET':
+        # Contract API response for GetBills
+        data = {
+            "status": "success",
+            "message": "success",
+            "data": [
+                {
+                    "tranYear": "2025_2026",
+                    "branchCode": 1,
+                    "branchName": "AEOC RPOS6",
+                    "voucherNo": "2025_2026_52_1_1",
+                    "voucherDate": "2026-03-02 00:00:00",
+                    "billRefNo": "HO-PU17",
+                    "billDate": "2026-03-02 00:00:00",
+                    "partyCode": 10060000046,
+                    "partyName": "sup new approved",
+                    "voucherType": "Purchase",
+                    "invoiceNo": "234343",
+                    "invoiceDate": "2026-03-02 00:00:00",
+                    "voucherAmount": 400,
+                    "expenseLedger": "Interstate GST28% Purchase",
+                    "goodsValue": 285.71,
+                    "taxAmount": 114.29,
+                    "taxCode": "GST 28%+Cess 12%",
+                    "taxType": "IGST",
+                    "tdsAmount": 0,
+                    "tdsSection": " ",
+                    "dueDays": 0,
+                    "dueDate": "2026-03-02 00:00:00",
+                    "payMode": "Bank",
+                    "otherCharges": 0,
+                    "paymentStatus": "NOT PAID",
+                    "transactionLink": "/TrueBooks/transactionRedirect.do?companyCode=1&tranYear=2025_2026&acType=1&divisionCode=1&locationCode=1&voucherNo=45&isVoucherScr=Y&voucherCode=3&ishqvoucher=1&isdelete=0&invoiceno=234343&operation=VIEW",
+                    "payable": 400,
+                    "groupName": "Suppliers",
+                    "billUniqueId": "45_1_1_1"
+                },
+                {
+                    "tranYear": "2025_2026",
+                    "branchCode": 1,
+                    "branchName": "AEOC RPOS6",
+                    "voucherNo": "2025_2026_53_1_1",
+                    "voucherDate": "2026-03-02 00:00:00",
+                    "billRefNo": "HO-PU18",
+                    "billDate": "2026-03-02 00:00:00",
+                    "partyCode": 10060000046,
+                    "partyName": "sup new approved",
+                    "voucherType": "Purchase",
+                    "invoiceNo": "3ewe3",
+                    "invoiceDate": "2026-02-03 00:00:00",
+                    "voucherAmount": 100,
+                    "expenseLedger": "Interstate GST28% Purchase",
+                    "goodsValue": 34.72,
+                    "taxAmount": 65.28,
+                    "taxCode": "GST 28%+Cess 160%",
+                    "taxType": "IGST",
+                    "tdsAmount": 0,
+                    "tdsSection": " ",
+                    "dueDays": 0,
+                    "dueDate": "2026-02-03 00:00:00",
+                    "payMode": "Bank",
+                    "otherCharges": 0,
+                    "paymentStatus": "NOT PAID",
+                    "transactionLink": "/TrueBooks/transactionRedirect.do?companyCode=1&tranYear=2025_2026&acType=1&divisionCode=1&locationCode=1&voucherNo=46&isVoucherScr=Y&voucherCode=3&ishqvoucher=1&isdelete=0&invoiceno=3ewe3&operation=VIEW",
+                    "payable": 100,
+                    "groupName": "Suppliers",
+                    "billUniqueId": "46_1_1_1"
+                }
+            ]
+        }
+        return JsonResponse(data)
+    return JsonResponse({"error": "Method not allowed"}, status=405)
+
+@csrf_exempt
+def central_payment(request):
+    if request.method == 'POST':
+        data = {
+            "docNo": "HO-PY7",
+            "hoVoucherNo": "1",
+            "message": "Success"
+        }
+        return JsonResponse(data)
+    return JsonResponse({"error": "Method not allowed"}, status=405)

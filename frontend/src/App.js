@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import Navbar from './components/Navbar';
 import LoginPage from './components/LoginPage';
 import Dashboard from './components/Dashboard';
+import { ThemeProvider } from './components/ThemeContext';
 
 function App() {
   const [user, setUser] = useState(null);
@@ -33,30 +34,35 @@ function App() {
       .then(() => {
         setUser(null);
         window.location.href = '/';
+      })
+      .catch(err => {
+        console.error("Logout failed", err);
+        setUser(null);
+        window.location.href = '/';
       });
   };
 
-  if (loading) {
-    return (
-      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', backgroundColor: '#f0f2f5' }}>
-        <div style={{ fontSize: '1.2rem', color: '#555' }}>Loading...</div>
-      </div>
-    );
-  }
-
   return (
-    <Router>
-      <div className="App" style={{ minHeight: '100vh', backgroundColor: '#f0f2f5', fontFamily: "'Segoe UI', Roboto, Helvetica, Arial, sans-serif" }}>
-        <Navbar user={user} onLogout={handleLogout} />
-        <main style={{ padding: '2rem', maxWidth: '1200px', margin: '0 auto' }}>
-          <Routes>
-            <Route path="/" element={
-              user ? <Dashboard user={user} /> : <LoginPage onLogin={handleLogin} />
-            } />
-          </Routes>
-        </main>
-      </div>
-    </Router>
+    <ThemeProvider>
+      {loading ? (
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)' }}>
+          <div style={{ fontSize: '1.2rem' }}>Loading...</div>
+        </div>
+      ) : (
+        <Router>
+          <div className="App" style={{ minHeight: '100vh', backgroundColor: 'var(--background-secondary)', fontFamily: "'Segoe UI', Roboto, Helvetica, Arial, sans-serif", color: 'var(--text-primary)' }}>
+            <Navbar user={user} onLogout={handleLogout} />
+            <main style={{ padding: '2rem', maxWidth: '1200px', margin: '0 auto' }}>
+              <Routes>
+                <Route path="/" element={
+                  user ? <Dashboard user={user} /> : <LoginPage onLogin={handleLogin} />
+                } />
+              </Routes>
+            </main>
+          </div>
+        </Router>
+      )}
+    </ThemeProvider>
   );
 }
 

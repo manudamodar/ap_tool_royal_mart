@@ -7,33 +7,36 @@ const LoginPage = ({ onLogin }) => {
       flexDirection: 'column',
       alignItems: 'center',
       justifyContent: 'center',
-      backgroundColor: 'white',
+      backgroundColor: 'var(--card-background)',
       padding: '4rem 2rem',
       borderRadius: '8px',
-      boxShadow: '0 4px 6px rgba(0,0,0,0.05)',
+      boxShadow: '0 4px 6px var(--shadow-color)',
       maxWidth: '500px',
       margin: '5rem auto', // Center the login box vertically
-      textAlign: 'center'
+      textAlign: 'center',
+      border: '1px solid var(--card-border)',
+      transition: 'background-color 0.3s, color 0.3s'
     }}>
       <div style={{
         width: '80px',
         height: '80px',
-        backgroundColor: '#f0f2f5',
+        backgroundColor: 'var(--background-secondary)',
         borderRadius: '50%',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        marginBottom: '1.5rem'
+        marginBottom: '1.5rem',
+        color: 'var(--primary-accent)'
       }}>
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#E31837" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
           <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
         </svg>
       </div>
-      <h2 style={{ color: '#333', marginBottom: '1rem', fontSize: '1.8rem' }}>
+      <h2 style={{ color: 'var(--text-primary)', marginBottom: '1rem', fontSize: '1.8rem' }}>
         Secure Login
       </h2>
-      <p style={{ color: '#666', marginBottom: '2.5rem', lineHeight: '1.5' }}>
+      <p style={{ color: 'var(--text-secondary)', marginBottom: '2.5rem', lineHeight: '1.5' }}>
         Access to the AP Automation Portal is restricted. Please sign in using your corporate Microsoft account.
       </p>
 
@@ -44,7 +47,7 @@ const LoginPage = ({ onLogin }) => {
           alignItems: 'center',
           justifyContent: 'center',
           gap: '10px',
-          backgroundColor: '#0078D4', // Microsoft Blue
+          backgroundColor: '#0078D4', // Microsoft Blue (Brand color, keeping it static or could be variable if desired)
           color: 'white',
           border: 'none',
           padding: '12px 24px',
