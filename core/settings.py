@@ -97,6 +97,10 @@ STATICFILES_DIRS = [
     os.path.join(BASE_DIR, 'frontend', 'build'),
 ]
 
+# Set the media root so uploaded files go to a specific local directory
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # MSAL Configuration
@@ -122,3 +126,13 @@ LOGGING = {
         'level': 'INFO',
     },
 }
+
+DATA_UPLOAD_MAX_NUMBER_FILES = 1000  # Allow uploading large folders (default is 100)
+
+# Celery Configuration
+CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'UTC'

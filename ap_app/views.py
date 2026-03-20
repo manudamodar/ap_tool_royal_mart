@@ -1,3 +1,5 @@
+import os
+import json
 import msal
 import logging
 import requests
@@ -8,7 +10,10 @@ from django.http import JsonResponse
 from django.contrib.auth import login, logout
 from django.contrib.auth.models import User
 from django.views.decorators.csrf import csrf_exempt
-from .models import UserProfile, UserRole
+from django.core.files.storage import FileSystemStorage
+from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
+from .models import UserProfile, UserRole, OCRBatch, DocumentResult, BatchStatus
+from .tasks import process_ocr_batch
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +93,6 @@ def msal_callback(request):
     logger.info(f"UserProfile {'created' if profile_created else 'retrieved'} for user {user.username}. Role is {profile.role}.")
 
     # Update MSAL data and photo.
-    # We update the msal_data dictionary but we preserve the old MSAL data and just update it
-    # so we don't lose information if MSAL gives less info next time.
     if profile.msal_data:
         updated_data = profile.msal_data.copy()
         updated_data.update(user_info)
@@ -139,6 +142,184 @@ def get_user_info(request):
     else:
         return JsonResponse({"authenticated": False})
 
+
+# --- FOR TESTING: User Type Allocation Change Feature (To be removed later) ---
+@csrf_exempt
+def change_user_role(request):
+    """
+    FOR TESTING ONLY: Allows a user to change their own role.
+    TODO: REMOVE THIS ENDPOINT AND UI COMPONENT IN PRODUCTION.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+        
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            new_role = data.get('role')
+            
+            if new_role not in [role[0] for role in UserRole.choices]:
+                return JsonResponse({"error": "Invalid role specified"}, status=400)
+                
+            profile, _ = UserProfile.objects.get_or_create(user=request.user)
+            profile.role = new_role
+            profile.save()
+            
+            return JsonResponse({"message": "Role updated successfully", "new_role": profile.role})
+        except json.JSONDecodeError:
+            return JsonResponse({"error": "Invalid JSON"}, status=400)
+        except Exception as e:
+             return JsonResponse({"error": str(e)}, status=500)
+    return JsonResponse({"error": "Method not allowed"}, status=405)
+# -----------------------------------------------------------------------------
+
+# --- OCR Workflow Views ---
+
+@csrf_exempt
+def upload_batch(request):
+    """
+    Phase 1: API Ingestion
+    Accepts multiple files (simulating a folder upload), saves them locally,
+    creates a Batch record, triggers Celery, and returns 202 immediately.
+    """
+    if request.method != 'POST':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    files = request.FILES.getlist('files')
+    if not files:
+        return JsonResponse({"error": "No files provided"}, status=400)
+
+    # 1. Create the Batch Database record
+    batch = OCRBatch.objects.create(
+        uploaded_by=request.user,
+        status=BatchStatus.PENDING,
+        total_files=len(files)
+    )
+
+    # 2. Storage: Save files to temporary local directory
+    # e.g., media/temp_ocr/[batch_id]/
+    temp_dir = os.path.join(settings.MEDIA_ROOT, 'temp_ocr', str(batch.batch_id))
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    fs = FileSystemStorage(location=temp_dir)
+    for f in files:
+        # Save the file using its original name
+        # If the user uploaded a folder, the frontend sometimes passes the relative path as the filename
+        # We need to sanitize it to just the filename to avoid directory traversal issues
+        safe_filename = os.path.basename(f.name)
+        fs.save(safe_filename, f)
+    
+    # 3. Phase 2 Trigger: Call Celery worker (asynchronous)
+    # The .delay() method puts the task in the Redis queue for the Celery worker to pick up
+    process_ocr_batch.delay(str(batch.batch_id), temp_dir)
+
+    # 4. Return 202 Accepted immediately
+    return JsonResponse({
+        "message": "Batch accepted for processing",
+        "batch_id": str(batch.batch_id),
+        "total_files": len(files)
+    }, status=202)
+
+
+def check_batch_status(request, batch_id):
+    """
+    Phase 4: Result Retrieval
+    Frontend polls this endpoint. Returns status. If complete, returns data.
+    """
+    if not request.user.is_authenticated:
+         return JsonResponse({"error": "Unauthorized"}, status=401)
+         
+    try:
+        batch = OCRBatch.objects.get(pk=batch_id)
+        
+        # Verify ownership (optional, depending on your auth model)
+        if batch.uploaded_by != request.user:
+            return JsonResponse({"error": "Forbidden"}, status=403)
+
+        response_data = {
+            "batch_id": str(batch.batch_id),
+            "status": batch.status,
+            "total_files": batch.total_files,
+            "processed_files": batch.processed_files,
+        }
+
+        # If completed, fetch and return all the parsed data
+        if batch.status == BatchStatus.COMPLETED:
+            documents = DocumentResult.objects.filter(batch=batch)
+            results = []
+            for doc in documents:
+                results.append({
+                    "id": doc.id,
+                    "filename": doc.original_filename,
+                    "extracted_text": doc.extracted_text,
+                    "processed_at": doc.processed_at
+                })
+            response_data["results"] = results
+            
+        return JsonResponse(response_data)
+
+    except OCRBatch.DoesNotExist:
+        return JsonResponse({"error": "Batch not found"}, status=404)
+
+
+def get_user_batches(request):
+    """
+    Returns a paginated list of OCR batches uploaded by the current user.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+        
+    try:
+        batches = OCRBatch.objects.filter(uploaded_by=request.user).order_by('-created_at')
+        
+        # Implementing Pagination
+        page = request.GET.get('page', 1)
+        per_page = request.GET.get('limit', 5) # Default 5 items per page
+        
+        paginator = Paginator(batches, per_page)
+        
+        try:
+            batches_page = paginator.page(page)
+        except PageNotAnInteger:
+            batches_page = paginator.page(1)
+        except EmptyPage:
+            batches_page = paginator.page(paginator.num_pages)
+
+        batch_list = []
+        for b in batches_page:
+            first_doc_name = None
+            if b.status == BatchStatus.COMPLETED:
+                first_doc = DocumentResult.objects.filter(batch=b).first()
+                if first_doc:
+                    first_doc_name = first_doc.original_filename
+
+            batch_list.append({
+                "batch_id": str(b.batch_id),
+                "created_at": b.created_at,
+                "status": b.status,
+                "total_files": b.total_files,
+                "processed_files": b.processed_files,
+                "representative_file": first_doc_name
+            })
+            
+        return JsonResponse({
+            "batches": batch_list,
+            "pagination": {
+                "current_page": batches_page.number,
+                "total_pages": paginator.num_pages,
+                "total_items": paginator.count,
+                "has_next": batches_page.has_next(),
+                "has_previous": batches_page.has_previous()
+            }
+        })
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
+
+#do not write below this line
 @csrf_exempt
 def get_bills(request):
     if request.method == 'GET':

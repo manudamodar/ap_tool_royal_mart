@@ -1,5 +1,7 @@
+import uuid
 from django.db import models
 from django.contrib.auth.models import User
+from django.utils import timezone
 
 class UserRole(models.TextChoices):
     UNASSIGNED = 'UNASSIGNED', 'Unassigned'
@@ -50,3 +52,38 @@ class APInvoice(models.Model):
 
     def __str__(self):
         return f"Invoice {self.id} - {self.status}"
+
+# --- OCR Processing Models ---
+
+class BatchStatus(models.TextChoices):
+    PENDING = 'PENDING', 'Pending'
+    PROCESSING = 'INVOICES_SCANNING_IN_PROCESS', 'Invoices Scanning in Process'
+    COMPLETED = 'INVOICES_SCANNED', 'Invoices Scanned'
+    FAILED = 'FAILED', 'Failed'
+
+def generate_batch_id():
+    """Generates a human-readable batch ID like AP_YYYYMMDD_UUID"""
+    date_str = timezone.now().strftime('%Y%m%d')
+    short_uuid = str(uuid.uuid4())[:8].upper()
+    return f"AP_{date_str}_{short_uuid}"
+
+class OCRBatch(models.Model):
+    # Changed from UUIDField to CharField to support custom string IDs
+    batch_id = models.CharField(max_length=50, primary_key=True, default=generate_batch_id, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    status = models.CharField(max_length=40, choices=BatchStatus.choices, default=BatchStatus.PENDING)
+    total_files = models.IntegerField(default=0)
+    processed_files = models.IntegerField(default=0)
+
+    def __str__(self):
+        return f"Batch {self.batch_id} - {self.status}"
+
+class DocumentResult(models.Model):
+    batch = models.ForeignKey(OCRBatch, on_delete=models.CASCADE, related_name='documents')
+    original_filename = models.CharField(max_length=500)
+    processed_at = models.DateTimeField(auto_now_add=True)
+    extracted_text = models.TextField(null=True, blank=True)
+    
+    def __str__(self):
+        return f"Doc {self.id} from Batch {self.batch.batch_id}"

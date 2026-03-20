@@ -1,79 +1,187 @@
-/* Light Theme (Default) */
-:root {
-  --background-primary: #FFFFFF;
-  --background-secondary: #f0f2f5;
-  --text-primary: #1c1e21;
-  --text-secondary: #65676b;
-  --primary-accent: #E31837;
-  --primary-accent-hover: #c9142d;
-  --card-background: #FFFFFF;
-  --card-border: #e0e0e0;
-  --navbar-background: #FFFFFF;
-  --navbar-text: #1c1e21;
-  --button-background: #E31837;
-  --button-text: #FFFFFF;
-  --button-hover-background: #c9142d;
-  --shadow-color: rgba(0, 0, 0, 0.1);
-}
+/* Modern Reset & Typography */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
-/* Dark Theme */
-body.dark-theme {
-  --background-primary: #18191a;
-  --background-secondary: #242526;
-  --text-primary: #e4e6eb;
-  --text-secondary: #b0b3b8;
-  --primary-accent: #FF6B6B;
-  --primary-accent-hover: #FF8787;
-  --card-background: #242526;
-  --card-border: #3a3b3c;
-  --navbar-background: #242526;
-  --navbar-text: #e4e6eb;
-  --button-background: #FF6B6B;
-  --button-text: #18191a;
-  --button-hover-background: #FF8787;
-  --shadow-color: rgba(255, 255, 255, 0.1);
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
 }
-
 
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   background-color: var(--background-secondary);
   color: var(--text-primary);
-  transition: background-color 0.3s, color 0.3s;
+  /* Use a subtle transition for theme changes */
+  transition: background-color 0.4s ease, color 0.4s ease;
 }
 
 code {
-  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
-    monospace;
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace;
 }
 
-nav {
-  box-shadow: 0 2px 4px var(--shadow-color);
-  background: var(--navbar-background) !important; /* important to override inline style */
-  border-bottom: 1px solid var(--card-border);
+h1, h2, h3, h4, h5, h6 {
+  color: var(--text-primary);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+/*
+  =========================================
+  THEME VARIABLES
+  =========================================
+*/
+
+/* Light Theme (Default) */
+:root {
+  /* Brand Colors - Standard Modern Application Palette */
+  --primary-accent: #2563EB; /* Modern Blue instead of aggressive Red */
+  --primary-accent-hover: #1D4ED8;
+  --primary-accent-light: rgba(37, 99, 235, 0.1);
+
+  /* Status Colors */
+  --success: #059669; /* Slightly deeper green for better contrast */
+  --success-bg: rgba(5, 150, 105, 0.1);
+  --danger: #DC2626; /* Softer red */
+  --danger-bg: rgba(220, 38, 38, 0.1);
+  --warning: #D97706;
+
+  /* Backgrounds */
+  --background-primary: #ffffff;
+  --background-secondary: #f1f5f9; /* Soft slate grey for background */
+
+  /* Surface / Cards */
+  --card-background: #ffffff;
+  --card-border: #e2e8f0;
+
+  /* Typography */
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-inverse: #ffffff;
+
+  /* Components */
+  --navbar-background: #ffffff;
+  --navbar-text: #0f172a;
+  --button-background: #2563EB;
+  --button-text: #ffffff;
+  --button-hover-background: #1D4ED8;
+
+  /* Effects */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+}
+
+/* Dark Theme */
+body.dark-theme {
+  /* Brand Colors */
+  --primary-accent: #3B82F6; /* Brighter blue for dark mode visibility */
+  --primary-accent-hover: #60A5FA;
+  --primary-accent-light: rgba(59, 130, 246, 0.15);
+
+  /* Status Colors */
+  --success: #34D399;
+  --success-bg: rgba(52, 211, 153, 0.15);
+  --danger: #F87171;
+  --danger-bg: rgba(248, 113, 113, 0.15);
+  --warning: #FBBF24;
+
+  /* Backgrounds */
+  --background-primary: #0f172a; /* Deep slate */
+  --background-secondary: #020617; /* Even darker slate */
+
+  /* Surface / Cards */
+  --card-background: #1e293b; /* Elevated slate */
+  --card-border: #334155;
+
+  /* Typography */
+  --text-primary: #f8fafc;
+  --text-secondary: #94a3b8;
+  --text-inverse: #ffffff;
+
+  /* Components */
+  --navbar-background: #1e293b;
+  --navbar-text: #f8fafc;
+  --button-background: #3B82F6;
+  --button-text: #ffffff;
+  --button-hover-background: #60A5FA;
+
+  /* Effects */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -1px rgba(0, 0, 0, 0.2);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -2px rgba(0, 0, 0, 0.3);
+}
+
+/*
+  =========================================
+  GLOBAL UTILITIES & ANIMATIONS
+  =========================================
+*/
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Smooth transitions for theme toggle on all major elements */
+nav, .card, .dashboard-container, button, div, span, table, th, td, tr {
+  transition: background-color 0.3s ease, border-color 0.3s ease, color 0.3s ease, box-shadow 0.3s ease;
 }
 
 button {
   background-color: var(--button-background);
   color: var(--button-text);
   border: none;
-  padding: 8px 16px;
-  border-radius: 4px;
+  padding: 10px 20px;
+  border-radius: 6px;
   cursor: pointer;
   font-size: 14px;
-  font-weight: 500;
-  transition: background-color 0.2s;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
 }
 
-button:hover {
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+button:not(:disabled):hover {
   background-color: var(--button-hover-background);
 }
 
-h1, h2, h3, h4, h5, h6 {
-  color: var(--text-primary);
+/* Glassmorphism effects where appropriate */
+.glass-panel {
+  background: var(--card-background);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--card-border);
+}
+
+/* Custom Scrollbar for a polished look */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--background-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--card-border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
 }
