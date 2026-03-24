@@ -16,6 +16,7 @@ urlpatterns = [
     path('ocr/status/<str:batch_id>/', views.check_batch_status, name='check_batch_status'),
     path('ocr/batches/', views.get_user_batches, name='get_user_batches'),
     path('ocr/document/<int:document_id>/', views.get_document_ocr_data, name='get_document_ocr_data'),
+    path('ocr/document/<int:document_id>/update/', views.update_document_data, name='update_document_data'),
 
     #do not write below this line
     path('rest/payable/getbills', views.get_bills, name='get_bills'),

@@ -87,8 +87,13 @@ def extract_data_from_image(file_path, endpoint, key):
             extracted_data["invoice_number"] = fields.get("InvoiceId").value if fields.get("InvoiceId") else None
             extracted_data["vendor_name"] = fields.get("VendorName").value if fields.get("VendorName") else None
             
-            # handle amount safely
-            if fields.get("InvoiceTotal"):
+            # --- PRIORITY AMOUNT EXTRACTION LOGIC ---
+            # 1. Try to get "AmountDue" (Net Payable) first
+            if fields.get("AmountDue"):
+                val = fields.get("AmountDue").value
+                extracted_data["total_amount"] = val.amount if hasattr(val, 'amount') else val
+            # 2. Fallback to "InvoiceTotal" if AmountDue is missing
+            elif fields.get("InvoiceTotal"):
                 val = fields.get("InvoiceTotal").value
                 extracted_data["total_amount"] = val.amount if hasattr(val, 'amount') else val
             else:

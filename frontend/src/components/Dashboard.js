@@ -23,9 +23,13 @@ const Dashboard = ({ user }) => {
   const [selectedDocument, setSelectedDocument] = useState(null);
   const [isFetchingDocument, setIsFetchingDocument] = useState(false);
 
+  // State for Editing Document
+  const [isEditingDoc, setIsEditingDoc] = useState(false);
+  const [editDocData, setEditDocData] = useState({});
+  const [isSavingDoc, setIsSavingDoc] = useState(false);
+
   const [notification, setNotification] = useState(null); // { message, type }
 
-  // Use a ref to track if we already showed the scanning toast for a specific batch to prevent double-firing
   const scanningToastShownRef = useRef(null);
 
   useEffect(() => {
@@ -91,8 +95,6 @@ const Dashboard = ({ user }) => {
   const onFilesSelected = (event) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
-
-    // Execute upload directly when files are selected
     executeFolderUpload(files);
   };
 
@@ -101,6 +103,7 @@ const Dashboard = ({ user }) => {
     setUploadProgress(0);
     setBatchStatus(null);
     setBatchData(null);
+    scanningToastShownRef.current = null; // Reset for new upload
 
     const formData = new FormData();
 
@@ -144,7 +147,7 @@ const Dashboard = ({ user }) => {
       const response = await uploadPromise;
 
       if (response.status === 202) {
-        // Immediately show the toast as soon as we get the 202 response
+        setUploadProgress(100);
         showNotification("File upload done! Background processing started.", "success");
 
         setActiveBatchId(response.data.batch_id);
@@ -159,11 +162,11 @@ const Dashboard = ({ user }) => {
     } catch (error) {
       console.error("Error uploading folder:", error);
       showNotification("An error occurred during upload. Check your network connection.", "error");
-    }
-
-    setIsUploading(false);
-    if (fileInputRef.current) {
-       fileInputRef.current.value = null;
+    } finally {
+        setIsUploading(false);
+        if (fileInputRef.current) {
+           fileInputRef.current.value = null;
+        }
     }
   };
 
@@ -171,20 +174,28 @@ const Dashboard = ({ user }) => {
   useEffect(() => {
     let pollInterval;
 
-    if (activeBatchId && (!batchStatus || (batchStatus !== 'INVOICES_SCANNED' && batchStatus !== 'FAILED' && batchStatus !== 'MANUAL_REVIEW')) && !isUploading) {
+    if (activeBatchId && (!batchStatus || (batchStatus !== 'INVOICES_SCANNED' && batchStatus !== 'FAILED' && batchStatus !== 'MANUAL_REVIEW' && batchStatus !== 'COMPLETED')) && !isUploading) {
       pollInterval = setInterval(async () => {
         try {
           const response = await fetch(`/api/ocr/status/${activeBatchId}/`);
           const data = await response.json();
 
           if (response.ok) {
-            // Check ref to ensure we ONLY show this once per batch ID
             if (data.status === 'INVOICES_SCANNING_IN_PROCESS' && scanningToastShownRef.current !== activeBatchId) {
                 showNotification("Invoices scanning in process...", "info");
                 scanningToastShownRef.current = activeBatchId;
             }
 
             setBatchStatus(data.status);
+
+            // This ensures the table also updates its progress bar dynamically
+            setRecentBatches(prevBatches =>
+                prevBatches.map(b =>
+                    b.batch_id === activeBatchId
+                        ? { ...b, status: data.status, processed_files: data.processed_files, total_files: data.total_files }
+                        : b
+                )
+            );
 
             if (data.total_files > 0) {
                setUploadProgress(Math.round((data.processed_files / data.total_files) * 100));
@@ -194,11 +205,9 @@ const Dashboard = ({ user }) => {
               clearInterval(pollInterval);
               if (data.status === 'INVOICES_SCANNED' || data.status === 'COMPLETED') {
                  setBatchData(data.results);
-                 fetchRecentBatches(currentPage);
                  showNotification("Batch processing complete! All documents verified.", "success");
               } else if (data.status === 'MANUAL_REVIEW') {
                  setBatchData(data.results);
-                 fetchRecentBatches(currentPage);
                  showNotification("Batch processed, but some documents require manual review.", "warning");
               } else {
                  showNotification("Batch processing failed.", "error");
@@ -214,13 +223,13 @@ const Dashboard = ({ user }) => {
     return () => {
       if (pollInterval) clearInterval(pollInterval);
     };
-  }, [activeBatchId, batchStatus, currentPage, isUploading]);
+  }, [activeBatchId, batchStatus, isUploading]);
 
   const handleBatchClick = async (batchId, status) => {
       setActiveBatchId(batchId);
       setBatchStatus(status);
 
-      if (status === 'INVOICES_SCANNED' || status === 'MANUAL_REVIEW' || status === 'COMPLETED') { // Added COMPLETED to be safe, though model uses INVOICES_SCANNED usually, tasks uses COMPLETED
+      if (status === 'INVOICES_SCANNED' || status === 'MANUAL_REVIEW' || status === 'COMPLETED') {
           try {
               const response = await fetch(`/api/ocr/status/${batchId}/`);
               const data = await response.json();
@@ -245,6 +254,8 @@ const Dashboard = ({ user }) => {
           const data = await response.json();
           if (response.ok) {
               setSelectedDocument(data);
+              setEditDocData(data.parsed_data || {});
+              setIsEditingDoc(false);
           } else {
               showNotification(data.error || "Failed to fetch document details.", "error");
           }
@@ -258,6 +269,60 @@ const Dashboard = ({ user }) => {
 
   const closeDocumentModal = () => {
       setSelectedDocument(null);
+      setIsEditingDoc(false);
+      setIsSavingDoc(false);
+  };
+
+  const handleEditDocChange = (e) => {
+      const { name, value } = e.target;
+      setEditDocData({
+          ...editDocData,
+          [name]: value
+      });
+  };
+
+  const saveDocumentChanges = async () => {
+      const changedFields = {};
+      Object.keys(editDocData).forEach(key => {
+          if (editDocData[key] !== selectedDocument.parsed_data[key]) {
+              changedFields[key] = editDocData[key];
+          }
+      });
+
+      if (Object.keys(changedFields).length === 0) {
+          showNotification("No changes made.", "info");
+          setIsEditingDoc(false);
+          return;
+      }
+
+      setIsSavingDoc(true);
+
+      try {
+          const response = await fetch(`/api/ocr/document/${selectedDocument.document_id}/update/`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ updates: changedFields })
+          });
+
+          const data = await response.json();
+          if (response.ok) {
+              showNotification("Document updated and re-verified!", "success");
+              setSelectedDocument(data.document);
+              setIsEditingDoc(false);
+
+              if (activeBatchId) {
+                  handleBatchClick(activeBatchId, data.batch_status);
+                  fetchRecentBatches(currentPage);
+              }
+          } else {
+              showNotification(data.error || "Failed to save changes", "error");
+          }
+      } catch (err) {
+          console.error("Error saving document:", err);
+          showNotification("Network error while saving.", "error");
+      } finally {
+          setIsSavingDoc(false);
+      }
   };
 
 
@@ -273,14 +338,14 @@ const Dashboard = ({ user }) => {
       let bgColor = 'var(--success)';
       if (isError) bgColor = 'var(--danger)';
       if (isInfo) bgColor = 'var(--primary-accent)';
-      if (isWarning) bgColor = '#faad14'; // Orange/Yellow
+      if (isWarning) bgColor = '#faad14';
 
       return (
           <div style={{
-              position: 'fixed', bottom: '24px', right: '24px', zIndex: 9998,
+              position: 'fixed', bottom: '24px', right: '24px', zIndex: 10001, // Increased z-index
               backgroundColor: bgColor,
               color: 'white', padding: '12px 20px', borderRadius: '8px',
-              boxShadow: 'var(--shadow-md)', fontWeight: '500',
+              boxShadow: 'var(--shadow-lg)', fontWeight: '500',
               display: 'flex', alignItems: 'center', gap: '8px',
               animation: 'slideUp 0.3s ease-out'
           }}>
@@ -420,6 +485,13 @@ const Dashboard = ({ user }) => {
 
   const formatStatus = (statusStr) => {
       if(!statusStr) return '';
+      // Better formatting for specific statuses
+      if(statusStr === 'INVOICES_SCANNING_IN_PROCESS') return 'Scanning in Process';
+      if(statusStr === 'INVOICES_SCANNED') return 'Verified';
+      if(statusStr === 'MANUALLY_VERIFIED') return 'Manually Verified';
+      if(statusStr === 'MANUAL_REVIEW') return 'Needs Review';
+
+      // Fallback
       return statusStr.replace(/_/g, ' ');
   };
 
@@ -431,16 +503,21 @@ const Dashboard = ({ user }) => {
   const getStatusColor = (status) => {
       switch (status) {
           case 'INVOICES_SCANNED':
-          case 'COMPLETED': // Sometimes the task sets it to this
+          case 'COMPLETED':
           case 'VERIFIED':
-              return { bg: 'var(--success-bg)', text: 'var(--success)' };
+          case 'MANUALLY_VERIFIED':
+              return { bg: 'transparent', text: 'var(--success)' };
           case 'FAILED':
           case 'NO_MATCH':
-              return { bg: 'var(--danger-bg)', text: 'var(--danger)' };
+              return { bg: 'transparent', text: 'var(--danger)' };
           case 'MANUAL_REVIEW':
-              return { bg: '#fffbe6', text: '#faad14' }; // Warning orange/yellow
+              return { bg: 'transparent', text: '#d97706' }; // Standard warning text color
+          case 'INVOICES_SCANNING_IN_PROCESS':
+          case 'PROCESSING':
+          case 'PENDING':
+              return { bg: 'transparent', text: 'var(--primary-accent)' };
           default:
-              return { bg: 'var(--primary-accent-light)', text: 'var(--primary-accent)' };
+              return { bg: 'transparent', text: 'var(--text-secondary)' };
       }
   };
 
@@ -565,15 +642,17 @@ const Dashboard = ({ user }) => {
                       <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
                           <thead>
                               <tr style={{ borderBottom: '2px solid var(--card-border)' }}>
-                                  <th style={{ padding: '10px', color: 'var(--text-secondary)', fontWeight: '600' }}>Batch ID</th>
-                                  <th style={{ padding: '10px', color: 'var(--text-secondary)', fontWeight: '600' }}>Date & Time</th>
-                                  <th style={{ padding: '10px', color: 'var(--text-secondary)', fontWeight: '600' }}>Files</th>
-                                  <th style={{ padding: '10px', color: 'var(--text-secondary)', fontWeight: '600' }}>Status</th>
+                                  <th style={{ padding: '12px 10px', color: 'var(--text-secondary)', fontWeight: '600' }}>Batch ID</th>
+                                  <th style={{ padding: '12px 10px', color: 'var(--text-secondary)', fontWeight: '600' }}>Date & Time</th>
+                                  <th style={{ padding: '12px 10px', color: 'var(--text-secondary)', fontWeight: '600' }}>Status</th>
                               </tr>
                           </thead>
                           <tbody style={{ opacity: isFetchingBatches ? 0.5 : 1, transition: 'opacity 0.2s' }}>
                               {recentBatches.map(batch => {
                                   const colors = getStatusColor(batch.status);
+                                  const isProcessing = batch.status === 'INVOICES_SCANNING_IN_PROCESS' || batch.status === 'PENDING' || batch.status === 'PROCESSING';
+                                  const pct = batch.total_files > 0 ? Math.round((batch.processed_files / batch.total_files) * 100) : 0;
+
                                   return (
                                   <tr
                                       key={batch.batch_id}
@@ -587,20 +666,23 @@ const Dashboard = ({ user }) => {
                                       onMouseEnter={(e) => e.currentTarget.style.backgroundColor = 'var(--card-background)'}
                                       onMouseLeave={(e) => e.currentTarget.style.backgroundColor = activeBatchId === batch.batch_id ? 'var(--card-background)' : 'transparent'}
                                   >
-                                      <td style={{ padding: '12px 10px', fontFamily: 'monospace', fontSize: '0.9rem', color: 'var(--primary-accent)' }}>
+                                      <td style={{ padding: '16px 10px', fontFamily: 'monospace', fontSize: '0.9rem', color: 'var(--text-primary)' }}>
                                           {batch.batch_id}
                                       </td>
-                                      <td style={{ padding: '12px 10px', fontSize: '0.9rem' }}>{formatDate(batch.created_at)}</td>
-                                      <td style={{ padding: '12px 10px', fontSize: '0.9rem' }}>{batch.processed_files} / {batch.total_files}</td>
-                                      <td style={{ padding: '12px 10px', fontSize: '0.85rem', fontWeight: 'bold' }}>
-                                          <span style={{
-                                              padding: '4px 8px',
-                                              borderRadius: '12px',
-                                              backgroundColor: colors.bg,
-                                              color: colors.text
-                                          }}>
-                                              {formatStatus(batch.status)}
-                                          </span>
+                                      <td style={{ padding: '16px 10px', fontSize: '0.9rem' }}>{formatDate(batch.created_at)}</td>
+
+                                      <td style={{ padding: '16px 10px', fontSize: '0.85rem', fontWeight: '600', minWidth: '200px' }}>
+                                          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                              <span style={{ color: colors.text }}>
+                                                  {formatStatus(batch.status)} {isProcessing ? `(${batch.processed_files}/${batch.total_files})` : ''}
+                                              </span>
+                                              {/* In-row progress bar */}
+                                              {isProcessing && (
+                                                  <div style={{ width: '100%', height: '4px', backgroundColor: 'var(--card-border)', borderRadius: '2px', overflow: 'hidden' }}>
+                                                      <div style={{ width: `${pct}%`, height: '100%', backgroundColor: colors.text, transition: 'width 0.3s ease' }}></div>
+                                                  </div>
+                                              )}
+                                          </div>
                                       </td>
                                   </tr>
                               )})}
@@ -651,37 +733,37 @@ const Dashboard = ({ user }) => {
         {/* Dynamic Detail View for Selected Batch */}
         {activeBatchId && (
           <div style={{ padding: '2rem', backgroundColor: 'var(--card-background)', borderRadius: '8px', boxShadow: '0 2px 4px var(--shadow-color)', border: '1px solid var(--card-border)' }}>
-            <h3 style={{ marginTop: 0, color: 'var(--primary-accent)', fontSize: '1.1rem' }}>Batch Details: {activeBatchId}</h3>
+            <h3 style={{ marginTop: 0, color: 'var(--text-primary)', fontSize: '1.2rem', marginBottom: '1.5rem', borderBottom: '1px solid var(--card-border)', paddingBottom: '0.5rem' }}>
+                Batch Details <span style={{ color: 'var(--text-secondary)', fontSize: '1rem', fontWeight: 'normal' }}>({activeBatchId})</span>
+            </h3>
 
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem', fontSize: '0.9rem' }}>
-              <span style={{ fontWeight: 'bold', color: 'var(--text-primary)' }}>Status: <span style={{ color: getStatusColor(batchStatus).text}}>{formatStatus(batchStatus)}</span></span>
-
-              {/* If uploading to server, we don't show the processing progress here yet */}
-              {!isUploading && (
-                  <span style={{ color: 'var(--text-secondary)' }}>{uploadProgress}%</span>
-              )}
-            </div>
-
-            {/* Processing Progress Bar */}
-            {!isUploading && (
+            {/* In-batch progress display logic */}
+            {isUploading ? (
                 <div style={{ width: '100%', height: '8px', backgroundColor: 'var(--background-secondary)', borderRadius: '4px', overflow: 'hidden', marginBottom: '1rem' }}>
                   <div style={{
                     height: '100%',
                     width: `${uploadProgress}%`,
-                    backgroundColor: batchStatus === 'FAILED' ? 'var(--danger)' : (batchStatus === 'INVOICES_SCANNED' || batchStatus === 'MANUAL_REVIEW' || batchStatus === 'COMPLETED') ? 'var(--success)' : 'var(--primary-accent)',
+                    backgroundColor: 'var(--primary-accent)',
                     transition: 'width 0.5s ease'
                   }} />
                 </div>
-            )}
+            ) : (!batchData && (batchStatus === 'PENDING' || batchStatus === 'INVOICES_SCANNING_IN_PROCESS' || batchStatus === 'PROCESSING')) ? (
+                <div style={{ textAlign: 'center', padding: '2rem' }}>
+                    <div style={{ display: 'inline-block', width: '40px', height: '40px', border: '4px solid var(--background-secondary)', borderTopColor: 'var(--primary-accent)', borderRadius: '50%', animation: 'spin 1s linear infinite', marginBottom: '1rem' }}></div>
+                    <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
+                    <h4 style={{ color: 'var(--primary-accent)', margin: 0 }}>Files are processing...</h4>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginTop: '0.5rem' }}>Please wait while the system extracts and reconciles the data.</p>
+                </div>
+            ) : batchData && (
+              <div style={{ paddingTop: '0.5rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: '1rem' }}>
+                    <h4 style={{ color: batchStatus === 'MANUAL_REVIEW' ? '#d97706' : 'var(--success)', margin: 0, fontSize: '1.1rem' }}>
+                        {batchStatus === 'MANUAL_REVIEW' ? 'Review Needed' : 'All Documents Verified'}
+                    </h4>
+                    <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Total Documents: {batchData.length}</span>
+                </div>
 
-            {(batchStatus === 'INVOICES_SCANNED' || batchStatus === 'MANUAL_REVIEW' || batchStatus === 'COMPLETED') && batchData && (
-              <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--card-border)', paddingTop: '1rem' }}>
-                <h4 style={{ color: batchStatus === 'MANUAL_REVIEW' ? '#faad14' : 'var(--success)', marginBottom: '0.5rem' }}>
-                    {batchStatus === 'MANUAL_REVIEW' ? 'Processing Complete (Review Needed)' : 'Processing Complete!'}
-                </h4>
-                <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>Extracted {batchData.length} documents.</p>
-
-                <div style={{ maxHeight: '400px', overflowY: 'auto', paddingRight: '10px' }}>
+                <div style={{ maxHeight: '500px', overflowY: 'auto', paddingRight: '10px' }}>
                   {batchData.map((doc) => {
                      const docColors = getStatusColor(doc.reconciliation_status);
                      return (
@@ -689,38 +771,39 @@ const Dashboard = ({ user }) => {
                       key={doc.id}
                       onClick={() => handleDocumentClick(doc.id)}
                       style={{
-                          padding: '1rem',
+                          padding: '1.25rem',
                           border: '1px solid var(--card-border)',
-                          borderRadius: '6px',
-                          marginBottom: '0.75rem',
+                          borderRadius: '8px',
+                          marginBottom: '1rem',
                           backgroundColor: 'var(--background-secondary)',
                           cursor: 'pointer',
-                          transition: 'border-color 0.2s',
+                          transition: 'border-color 0.2s, transform 0.2s',
                           borderLeft: `4px solid ${docColors.text}`
                       }}
-                      onMouseEnter={(e) => e.currentTarget.style.borderColor = 'var(--primary-accent)'}
-                      onMouseLeave={(e) => e.currentTarget.style.borderColor = 'var(--card-border)'}
+                      onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--text-secondary)'; e.currentTarget.style.transform = 'translateX(2px)'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--card-border)'; e.currentTarget.style.transform = 'translateX(0)'; }}
                     >
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                          <strong style={{ fontSize: '0.95rem', color: 'var(--text-primary)' }}>{doc.filename}</strong>
+                          <strong style={{ fontSize: '1rem', color: 'var(--text-primary)' }}>{doc.filename}</strong>
                           <span style={{
                               fontSize: '0.75rem',
                               fontWeight: 'bold',
-                              padding: '2px 8px',
-                              borderRadius: '10px',
-                              backgroundColor: docColors.bg,
-                              color: docColors.text
+                              color: docColors.text,
+                              textTransform: 'uppercase',
+                              letterSpacing: '0.5px'
                           }}>
                               {formatStatus(doc.reconciliation_status)}
                           </span>
                       </div>
 
-                      {doc.reconciliation_status !== 'VERIFIED' && doc.reconciliation_details && doc.reconciliation_details.message && (
-                          <div style={{ fontSize: '0.85rem', color: 'var(--danger)', marginBottom: '8px', padding: '4px', backgroundColor: 'var(--danger-bg)', borderRadius: '4px' }}>
-                              ⚠️ {doc.reconciliation_details.message}
-                              {doc.reconciliation_details.ocr_invoice_number && <span> - OCR Invoice: <b>{doc.reconciliation_details.ocr_invoice_number}</b></span>}
-                              {doc.reconciliation_details.ocr_amount && <span> - OCR Amount: <b>{doc.reconciliation_details.ocr_amount}</b></span>}
-                              {doc.reconciliation_details.api_amount && <span> - API Amount: <b>{doc.reconciliation_details.api_amount}</b></span>}
+                      {doc.reconciliation_status !== 'VERIFIED' && doc.reconciliation_status !== 'MANUALLY_VERIFIED' && doc.reconciliation_details && doc.reconciliation_details.message && (
+                          <div style={{ fontSize: '0.85rem', color: 'var(--danger)', marginTop: '12px', padding: '8px 12px', backgroundColor: 'var(--danger-bg)', borderRadius: '4px', borderLeft: '2px solid var(--danger)' }}>
+                              <strong style={{ display: 'block', marginBottom: '4px' }}>⚠️ {doc.reconciliation_details.message}</strong>
+                              <div style={{ display: 'flex', gap: '16px', color: 'var(--text-primary)' }}>
+                                  {doc.reconciliation_details.ocr_invoice_number && <span>OCR Invoice: <b>{doc.reconciliation_details.ocr_invoice_number}</b></span>}
+                                  {doc.reconciliation_details.ocr_amount && <span>OCR Amount: <b style={{color: 'var(--danger)'}}>{doc.reconciliation_details.ocr_amount}</b></span>}
+                                  {doc.reconciliation_details.api_amount && <span>System Amount: <b style={{color: 'var(--success)'}}>{doc.reconciliation_details.api_amount}</b></span>}
+                              </div>
                           </div>
                       )}
                     </div>
@@ -732,176 +815,258 @@ const Dashboard = ({ user }) => {
         )}
       </div>
 
-      {/* Document Details Modal */}
+      {/* Document Details & Edit Modal */}
       {selectedDocument && (
           <div style={{
               position: 'fixed',
               top: 0, left: 0, right: 0, bottom: 0,
-              backgroundColor: 'rgba(0, 0, 0, 0.5)',
+              backgroundColor: 'rgba(0, 0, 0, 0.6)',
               display: 'flex',
               justifyContent: 'center',
               alignItems: 'center',
-              zIndex: 10000
+              zIndex: 10000,
+              backdropFilter: 'blur(4px)'
           }} onClick={closeDocumentModal}>
               <div
                   style={{
                       backgroundColor: 'var(--card-background)',
-                      padding: '2rem',
-                      borderRadius: '8px',
-                      width: '80%',
-                      maxWidth: '900px',
-                      maxHeight: '90vh',
-                      overflowY: 'auto',
-                      boxShadow: '0 10px 25px rgba(0,0,0,0.2)',
-                      color: 'var(--text-primary)',
+                      borderRadius: '12px',
+                      width: '95%',
+                      maxWidth: '1200px',
+                      height: '90vh',
                       display: 'flex',
                       flexDirection: 'column',
-                      gap: '1rem'
+                      boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)',
+                      color: 'var(--text-primary)',
+                      overflow: 'hidden'
                   }}
-                  onClick={(e) => e.stopPropagation()} // Prevent clicking inside modal from closing it
+                  onClick={(e) => e.stopPropagation()}
               >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--card-border)', paddingBottom: '1rem' }}>
-                      <h2 style={{ margin: 0 }}>Document Details: {selectedDocument.original_filename}</h2>
-                      <button
-                          onClick={closeDocumentModal}
-                          style={{
-                              background: 'none', border: 'none', fontSize: '1.5rem', cursor: 'pointer', color: 'var(--text-secondary)'
-                          }}
-                      >
-                          &times;
-                      </button>
-                  </div>
-
-                  <div style={{ display: 'flex', gap: '2rem', marginTop: '1rem' }}>
-                      {/* Left Column: Parsed Data & API Match */}
-                      <div style={{ flex: 1, minWidth: '400px' }}>
-                          <div style={{ marginBottom: '1.5rem' }}>
-                              <h3 style={{ fontSize: '1.1rem', marginBottom: '0.5rem', color: 'var(--primary-accent)' }}>Extracted Key Fields</h3>
-                              <div style={{ backgroundColor: 'var(--background-secondary)', padding: '1rem', borderRadius: '6px', border: '1px solid var(--card-border)' }}>
-                                  {selectedDocument.parsed_data ? (
-                                      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                                          <tbody>
-                                              {Object.entries(selectedDocument.parsed_data).map(([key, value]) => {
-                                                  // Skip rendering tables here, handle them below
-                                                  if (key === 'tables') return null;
-                                                  return (
-                                                  <tr key={key} style={{ borderBottom: '1px solid var(--card-border)' }}>
-                                                      <td style={{ padding: '8px 4px', fontWeight: 'bold', color: 'var(--text-secondary)', textTransform: 'capitalize' }}>{key.replace('_', ' ')}</td>
-                                                      <td style={{ padding: '8px 4px' }}>{value !== null ? value.toString() : 'N/A'}</td>
-                                                  </tr>
-                                              )})}
-                                          </tbody>
-                                      </table>
-                                  ) : (
-                                      <p style={{ color: 'var(--text-secondary)', margin: 0 }}>No key fields extracted.</p>
-                                  )}
-                              </div>
-                          </div>
-
-                          <div style={{ marginBottom: '1.5rem' }}>
-                              <h3 style={{ fontSize: '1.1rem', marginBottom: '0.5rem', color: 'var(--primary-accent)' }}>Reconciliation Status</h3>
-                              <div style={{
-                                  backgroundColor: getStatusColor(selectedDocument.reconciliation_status).bg,
-                                  padding: '1rem',
-                                  borderRadius: '6px',
-                                  border: `1px solid ${getStatusColor(selectedDocument.reconciliation_status).text}`
+                  {/* Modal Header */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '1.5rem 2rem', borderBottom: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)' }}>
+                      <div>
+                          <h2 style={{ margin: '0 0 0.5rem 0', fontSize: '1.4rem' }}>
+                              Document Details: <span style={{ color: 'var(--text-secondary)', fontWeight: 'normal' }}>{selectedDocument.original_filename}</span>
+                          </h2>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                              <span style={{
+                                  fontSize: '0.8rem',
+                                  fontWeight: 'bold',
+                                  color: getStatusColor(selectedDocument.reconciliation_status).text,
+                                  textTransform: 'uppercase'
                               }}>
-                                  <strong style={{ color: getStatusColor(selectedDocument.reconciliation_status).text, display: 'block', marginBottom: '4px' }}>
-                                      {formatStatus(selectedDocument.reconciliation_status)}
-                                  </strong>
-                                  {selectedDocument.reconciliation_details && (
-                                      <pre style={{ fontSize: '0.85rem', whiteSpace: 'pre-wrap', wordWrap: 'break-word', color: 'var(--text-primary)', margin: 0 }}>
-                                          {JSON.stringify(selectedDocument.reconciliation_details, null, 2)}
-                                      </pre>
-                                  )}
-                              </div>
+                                  {formatStatus(selectedDocument.reconciliation_status)}
+                              </span>
+                              {selectedDocument.reconciliation_details?.message && (
+                                  <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
+                                      | {selectedDocument.reconciliation_details.message}
+                                  </span>
+                              )}
                           </div>
                       </div>
-
-                      {/* Right Column: Full Text or matched API data */}
-                      <div style={{ flex: 1 }}>
-                         {selectedDocument.matched_bill_data && (
-                              <div style={{ marginBottom: '1.5rem' }}>
-                                  <h3 style={{ fontSize: '1.1rem', marginBottom: '0.5rem', color: 'var(--success)' }}>Matched System Bill Data</h3>
-                                  <div style={{ backgroundColor: 'var(--background-secondary)', padding: '1rem', borderRadius: '6px', border: '1px solid var(--card-border)' }}>
-                                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
-                                          <tbody>
-                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Invoice No:</td><td style={{ padding: '4px' }}>{selectedDocument.matched_bill_data.invoiceNo}</td></tr>
-                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Party Name:</td><td style={{ padding: '4px' }}>{selectedDocument.matched_bill_data.partyName}</td></tr>
-                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Payable:</td><td style={{ padding: '4px', color: 'var(--primary-accent)', fontWeight: 'bold' }}>{selectedDocument.matched_bill_data.payable}</td></tr>
-                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Goods Value:</td><td style={{ padding: '4px' }}>{selectedDocument.matched_bill_data.goodsValue}</td></tr>
-                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Tax Amount:</td><td style={{ padding: '4px' }}>{selectedDocument.matched_bill_data.taxAmount}</td></tr>
-                                          </tbody>
-                                      </table>
-                                  </div>
-                              </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                          {selectedDocument.reconciliation_status !== 'VERIFIED' && selectedDocument.reconciliation_status !== 'MANUALLY_VERIFIED' && (
+                              <button
+                                  onClick={() => setIsEditingDoc(!isEditingDoc)}
+                                  style={{ padding: '8px 16px', backgroundColor: isEditingDoc ? 'var(--background-secondary)' : 'var(--primary-accent)', color: isEditingDoc ? 'var(--text-primary)' : 'white', border: isEditingDoc ? '1px solid var(--card-border)' : 'none' }}
+                              >
+                                  {isEditingDoc ? 'Cancel Editing' : 'Manual Correction'}
+                              </button>
                           )}
-
-                          <div>
-                              <h3 style={{ fontSize: '1.1rem', marginBottom: '0.5rem', color: 'var(--primary-accent)' }}>Raw Extracted Text</h3>
-                              <div style={{
-                                  backgroundColor: 'var(--background-secondary)',
-                                  padding: '1rem',
-                                  borderRadius: '6px',
-                                  border: '1px solid var(--card-border)',
-                                  maxHeight: '300px',
-                                  overflowY: 'auto',
-                                  fontSize: '0.85rem',
-                                  fontFamily: 'monospace',
-                                  whiteSpace: 'pre-wrap',
-                                  color: 'var(--text-secondary)'
-                              }}>
-                                  {selectedDocument.extracted_text || 'No text extracted.'}
-                              </div>
-                          </div>
+                          <button
+                              onClick={closeDocumentModal}
+                              style={{ background: 'none', border: 'none', fontSize: '1.5rem', cursor: 'pointer', color: 'var(--text-secondary)', padding: '0 8px' }}
+                          >
+                              &times;
+                          </button>
                       </div>
                   </div>
 
-                  {/* Bottom Row: Extracted Tables */}
-                  {selectedDocument.parsed_data && selectedDocument.parsed_data.tables && selectedDocument.parsed_data.tables.length > 0 && (
-                      <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--card-border)', paddingTop: '1rem' }}>
-                          <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--primary-accent)' }}>Extracted Tables</h3>
+                  {/* Modal Body - Scrollable */}
+                  <div style={{ padding: '2rem', overflowY: 'auto', flex: 1 }}>
+                      <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap' }}>
 
-                          {selectedDocument.parsed_data.tables.map((table, idx) => {
-                              // Reconstruct the table grid from cells
-                              const grid = Array(table.row_count).fill(null).map(() => Array(table.column_count).fill(""));
-                              table.cells.forEach(cell => {
-                                  if (cell.row_index < table.row_count && cell.column_index < table.column_count) {
-                                      grid[cell.row_index][cell.column_index] = cell.content;
-                                  }
-                              });
+                          {/* Left Column: Parsed Data & Editing */}
+                          <div style={{ flex: 1, minWidth: '350px' }}>
+                              <div style={{ marginBottom: '2rem' }}>
+                                  <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--text-primary)', borderBottom: '2px solid var(--primary-accent-light)', paddingBottom: '0.5rem' }}>Extracted Fields</h3>
+                                  <div style={{ backgroundColor: 'var(--background-secondary)', borderRadius: '8px', border: '1px solid var(--card-border)', overflow: 'hidden' }}>
 
-                              return (
-                                  <div key={idx} style={{ marginBottom: '2rem', overflowX: 'auto' }}>
-                                      <h4 style={{ fontSize: '0.9rem', marginBottom: '0.5rem', color: 'var(--text-secondary)' }}>Table {idx + 1}</h4>
-                                      <table style={{ width: '100%', borderCollapse: 'collapse', border: '1px solid var(--card-border)' }}>
-                                          <tbody>
-                                              {grid.map((row, rowIndex) => (
-                                                  <tr key={rowIndex}>
-                                                      {row.map((cellContent, colIndex) => (
-                                                          <td
-                                                              key={colIndex}
-                                                              style={{
-                                                                  border: '1px solid var(--card-border)',
-                                                                  padding: '8px',
-                                                                  fontSize: '0.85rem',
-                                                                  backgroundColor: rowIndex === 0 ? 'var(--background-secondary)' : 'transparent',
-                                                                  fontWeight: rowIndex === 0 ? 'bold' : 'normal'
-                                                              }}
-                                                          >
-                                                              {cellContent}
+                                      {isEditingDoc ? (
+                                          <div style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                                              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                                  <label style={{ fontSize: '0.9rem', fontWeight: '600', color: 'var(--text-secondary)' }}>Invoice Number</label>
+                                                  <input
+                                                      type="text"
+                                                      name="invoice_number"
+                                                      value={editDocData.invoice_number || ''}
+                                                      onChange={handleEditDocChange}
+                                                      style={{ padding: '10px', borderRadius: '6px', border: '1px solid var(--primary-accent)', backgroundColor: 'var(--card-background)', color: 'var(--text-primary)', fontSize: '1rem' }}
+                                                  />
+                                              </div>
+                                              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                                                  <label style={{ fontSize: '0.9rem', fontWeight: '600', color: 'var(--text-secondary)' }}>Total Amount / Payable</label>
+                                                  <input
+                                                      type="number"
+                                                      step="0.01"
+                                                      name="total_amount"
+                                                      value={editDocData.total_amount || ''}
+                                                      onChange={handleEditDocChange}
+                                                      style={{ padding: '10px', borderRadius: '6px', border: '1px solid var(--primary-accent)', backgroundColor: 'var(--card-background)', color: 'var(--text-primary)', fontSize: '1rem' }}
+                                                  />
+                                              </div>
+                                              <button
+                                                onClick={saveDocumentChanges}
+                                                disabled={isSavingDoc}
+                                                style={{ marginTop: '1rem', padding: '12px', backgroundColor: 'var(--success)', fontSize: '1rem', opacity: isSavingDoc ? 0.7 : 1 }}
+                                              >
+                                                  {isSavingDoc ? 'Saving...' : 'Save Corrections & Re-verify'}
+                                              </button>
+                                          </div>
+                                      ) : selectedDocument.parsed_data ? (
+                                          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                                              <tbody>
+                                                  {Object.entries(selectedDocument.parsed_data).map(([key, value]) => {
+                                                      if (key === 'tables') return null;
+                                                      const isHighlighted = key === 'invoice_number' || key === 'total_amount';
+                                                      return (
+                                                      <tr key={key} style={{ borderBottom: '1px solid var(--card-border)' }}>
+                                                          <td style={{ padding: '12px 16px', fontWeight: '600', color: 'var(--text-secondary)', textTransform: 'capitalize', width: '40%', backgroundColor: 'rgba(0,0,0,0.02)' }}>{key.replace('_', ' ')}</td>
+                                                          <td style={{ padding: '12px 16px', fontWeight: isHighlighted ? 'bold' : 'normal', color: isHighlighted ? 'var(--primary-accent)' : 'var(--text-primary)', fontSize: isHighlighted ? '1.05rem' : '0.95rem' }}>
+                                                              {value !== null ? value.toString() : <span style={{color: 'var(--text-secondary)', fontStyle: 'italic'}}>Missing</span>}
                                                           </td>
-                                                      ))}
-                                                  </tr>
-                                              ))}
-                                          </tbody>
-                                      </table>
+                                                      </tr>
+                                                  )})}
+                                              </tbody>
+                                          </table>
+                                      ) : (
+                                          <p style={{ padding: '1rem', color: 'var(--text-secondary)', margin: 0 }}>No key fields extracted.</p>
+                                      )}
                                   </div>
-                              );
-                          })}
-                      </div>
-                  )}
+                              </div>
 
+                              {/* Matched API Data directly below parsed data for easy comparison */}
+                              <div style={{ marginBottom: '2rem' }}>
+                                  <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--text-primary)', borderBottom: '2px solid var(--success-bg)', paddingBottom: '0.5rem' }}>Matched System Bill Data</h3>
+                                  {selectedDocument.matched_bill_data ? (
+                                      <div style={{ backgroundColor: 'var(--background-secondary)', borderRadius: '8px', border: '1px solid var(--card-border)', overflow: 'hidden' }}>
+                                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.95rem' }}>
+                                              <tbody>
+                                                  <tr style={{ borderBottom: '1px solid var(--card-border)' }}><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', width: '40%', backgroundColor: 'rgba(0,0,0,0.02)' }}>Invoice No:</td><td style={{ padding: '12px 16px', fontWeight: 'bold' }}>{selectedDocument.matched_bill_data.invoiceNo}</td></tr>
+                                                  <tr style={{ borderBottom: '1px solid var(--card-border)' }}><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Party Name:</td><td style={{ padding: '12px 16px' }}>{selectedDocument.matched_bill_data.partyName}</td></tr>
+                                                  <tr style={{ borderBottom: '1px solid var(--card-border)' }}><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Payable:</td><td style={{ padding: '12px 16px', color: 'var(--text-primary)', fontWeight: 'bold', fontSize: '1.05rem' }}>{selectedDocument.matched_bill_data.payable}</td></tr>
+                                                  <tr style={{ borderBottom: '1px solid var(--card-border)' }}><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Goods Value:</td><td style={{ padding: '12px 16px' }}>{selectedDocument.matched_bill_data.goodsValue}</td></tr>
+                                                  <tr><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Tax Amount:</td><td style={{ padding: '12px 16px' }}>{selectedDocument.matched_bill_data.taxAmount}</td></tr>
+                                              </tbody>
+                                          </table>
+                                      </div>
+                                  ) : (
+                                      <div style={{ backgroundColor: 'var(--background-secondary)', padding: '1.5rem', borderRadius: '8px', border: '1px dashed var(--card-border)' }}>
+                                          <p style={{ margin: 0, color: 'var(--text-secondary)', fontWeight: '500', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                                              No matching bill found in the system for this invoice number.
+                                          </p>
+                                      </div>
+                                  )}
+                              </div>
+                          </div>
+
+                          {/* Right Column: Full Text & Audit Trail */}
+                          <div style={{ flex: 1, minWidth: '350px', display: 'flex', flexDirection: 'column', gap: '2rem' }}>
+
+                              {/* Audit Trail Section */}
+                              <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
+                                  <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)', paddingBottom: '0.5rem' }}>Audit Log</h3>
+                                  <div style={{
+                                      display: 'flex',
+                                      flexDirection: 'column',
+                                      gap: '12px',
+                                      maxHeight: '350px', // Set a maximum height for the audit log area
+                                      overflowY: 'auto',  // Make it scrollable
+                                      paddingRight: '10px' // Add a bit of padding for the scrollbar
+                                  }}>
+                                      {/* Manual Corrections - Rendered IN REVERSE ORDER (latest first) */}
+                                      {selectedDocument.audit_trail && [...selectedDocument.audit_trail].reverse().map((log, idx) => (
+                                          <div key={idx} style={{ padding: '12px 16px', backgroundColor: 'var(--card-background)', borderLeft: '4px solid var(--primary-accent)', borderRadius: '6px', fontSize: '0.9rem', border: '1px solid var(--card-border)', borderLeftWidth: '4px' }}>
+                                              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px', color: 'var(--text-secondary)', fontSize: '0.8rem' }}>
+                                                  <span>{formatDate(log.timestamp)}</span>
+                                                  <span>{log.user_name}</span>
+                                              </div>
+                                              <strong style={{ color: 'var(--primary-accent)' }}>{log.action}</strong>
+
+                                              {/* Formatted details showing old -> new values */}
+                                              <div style={{ marginTop: '8px', backgroundColor: 'var(--background-secondary)', padding: '8px', borderRadius: '4px' }}>
+                                                  {log.changes && Object.entries(log.changes).map(([field, change]) => (
+                                                      <div key={field} style={{ marginBottom: '4px', fontSize: '0.85rem', display: 'flex', alignItems: 'center' }}>
+                                                          <span style={{ fontWeight: '600', textTransform: 'capitalize', color: 'var(--text-primary)', width: '120px' }}>{field.replace('_', ' ')}: </span>
+                                                          <span style={{ color: 'var(--text-secondary)', textDecoration: 'line-through' }}>{change.old || 'None'}</span>
+                                                          <span style={{ margin: '0 8px', color: 'var(--text-secondary)' }}>➔</span>
+                                                          <span style={{ color: 'var(--success)', fontWeight: 'bold' }}>{change.new || 'None'}</span>
+                                                      </div>
+                                                  ))}
+                                              </div>
+                                          </div>
+                                      ))}
+
+                                      {/* System Creation Log (Always at the bottom / oldest) */}
+                                      <div style={{ padding: '12px 16px', backgroundColor: 'var(--background-secondary)', borderLeft: '4px solid var(--text-secondary)', borderRadius: '6px', fontSize: '0.9rem' }}>
+                                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px', color: 'var(--text-secondary)', fontSize: '0.8rem' }}>
+                                              <span>{formatDate(selectedDocument.processed_at)}</span>
+                                              <span>System Process</span>
+                                          </div>
+                                          <strong style={{ color: 'var(--text-primary)' }}>Document Processed</strong>
+                                          <p style={{ margin: '4px 0 0 0', color: 'var(--text-secondary)' }}>Initial OCR extraction and reconciliation attempted.</p>
+                                      </div>
+                                  </div>
+                              </div>
+                          </div>
+                      </div>
+
+                      {/* Bottom Row: Extracted Tables */}
+                      {selectedDocument.parsed_data && selectedDocument.parsed_data.tables && selectedDocument.parsed_data.tables.length > 0 && (
+                          <div style={{ marginTop: '3rem', borderTop: '1px solid var(--card-border)', paddingTop: '2rem' }}>
+                              <h3 style={{ fontSize: '1.2rem', marginBottom: '1.5rem', color: 'var(--text-primary)' }}>Extracted Line Items (Tables)</h3>
+
+                              {selectedDocument.parsed_data.tables.map((table, idx) => {
+                                  const grid = Array(table.row_count).fill(null).map(() => Array(table.column_count).fill(""));
+                                  table.cells.forEach(cell => {
+                                      if (cell.row_index < table.row_count && cell.column_index < table.column_count) {
+                                          grid[cell.row_index][cell.column_index] = cell.content;
+                                      }
+                                  });
+
+                                  return (
+                                      <div key={idx} style={{ marginBottom: '2.5rem', overflowX: 'auto', backgroundColor: 'var(--background-secondary)', padding: '1rem', borderRadius: '8px', border: '1px solid var(--card-border)' }}>
+                                          <h4 style={{ fontSize: '0.95rem', marginBottom: '1rem', color: 'var(--text-secondary)' }}>Table {idx + 1}</h4>
+                                          <table style={{ width: '100%', borderCollapse: 'collapse', backgroundColor: 'var(--card-background)' }}>
+                                              <tbody>
+                                                  {grid.map((row, rowIndex) => (
+                                                      <tr key={rowIndex}>
+                                                          {row.map((cellContent, colIndex) => (
+                                                              <td
+                                                                  key={colIndex}
+                                                                  style={{
+                                                                      border: '1px solid var(--card-border)',
+                                                                      padding: '12px',
+                                                                      fontSize: '0.85rem',
+                                                                      backgroundColor: rowIndex === 0 ? 'var(--background-secondary)' : 'transparent',
+                                                                      fontWeight: rowIndex === 0 ? 'bold' : 'normal',
+                                                                      color: rowIndex === 0 ? 'var(--text-secondary)' : 'var(--text-primary)'
+                                                                  }}
+                                                              >
+                                                                  {cellContent}
+                                                              </td>
+                                                          ))}
+                                                      </tr>
+                                                  ))}
+                                              </tbody>
+                                          </table>
+                                      </div>
+                                  );
+                              })}
+                          </div>
+                      )}
+                  </div>
               </div>
           </div>
       )}

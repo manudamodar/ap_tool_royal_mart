@@ -4,6 +4,8 @@ import msal
 import logging
 import requests
 import base64
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from django.conf import settings
 from django.shortcuts import redirect
 from django.http import JsonResponse
@@ -13,7 +15,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.core.files.storage import FileSystemStorage
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from .models import UserProfile, UserRole, OCRBatch, DocumentResult, BatchStatus, ReconciliationStatus
-from .tasks import process_ocr_batch
+from .tasks import process_ocr_batch, call_getbills_api
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,18 @@ def msal_callback(request):
     # Role assignment logic removed. UserProfile will default to UNASSIGNED.
     logger.info(f"User {email} will be created/retrieved with an UNASSIGNED role.")
 
-    user, user_created = User.objects.get_or_create(username=email, defaults={'email': email, 'first_name': name})
+    # We can try to extract first and last name from 'name'
+    first_name = name.split()[0] if name else ''
+    last_name = " ".join(name.split()[1:]) if name and len(name.split()) > 1 else ''
+
+    user, user_created = User.objects.get_or_create(username=email, defaults={'email': email, 'first_name': first_name, 'last_name': last_name})
+    
+    # If the user already existed, update their names if possible
+    if not user_created:
+        user.first_name = first_name
+        user.last_name = last_name
+        user.save()
+
     logger.info(f"User {'created' if user_created else 'retrieved'}: {user.username}")
     
     profile, profile_created = UserProfile.objects.get_or_create(user=user)
@@ -130,12 +143,17 @@ def get_user_info(request):
             msal_data = {}
             photo = None
             
+        full_name = f"{request.user.first_name} {request.user.last_name}".strip()
+        if not full_name:
+            full_name = request.user.username
+
         return JsonResponse({
             "authenticated": True,
             "username": request.user.username,
             "role": role,
             "email": request.user.email,
             "first_name": request.user.first_name,
+            "full_name": full_name,
             "msal_data": msal_data,
             "photo": photo,
         })
@@ -206,14 +224,10 @@ def upload_batch(request):
     
     fs = FileSystemStorage(location=temp_dir)
     for f in files:
-        # Save the file using its original name
-        # If the user uploaded a folder, the frontend sometimes passes the relative path as the filename
-        # We need to sanitize it to just the filename to avoid directory traversal issues
         safe_filename = os.path.basename(f.name)
         fs.save(safe_filename, f)
     
     # 3. Phase 2 Trigger: Call Celery worker (asynchronous)
-    # The .delay() method puts the task in the Redis queue for the Celery worker to pick up
     process_ocr_batch.delay(str(batch.batch_id), temp_dir)
 
     # 4. Return 202 Accepted immediately
@@ -227,7 +241,7 @@ def upload_batch(request):
 def check_batch_status(request, batch_id):
     """
     Phase 4: Result Retrieval
-    Frontend polls this endpoint. Returns status. If complete, returns data.
+    Frontend polls this endpoint. Returns status. Always returns the current data we have so far.
     """
     if not request.user.is_authenticated:
          return JsonResponse({"error": "Unauthorized"}, status=401)
@@ -246,21 +260,21 @@ def check_batch_status(request, batch_id):
             "processed_files": batch.processed_files,
         }
 
-        # If completed, manual review, or failed, fetch and return all the parsed data we have so far
-        if str(batch.status) in [BatchStatus.COMPLETED, BatchStatus.MANUAL_REVIEW, BatchStatus.FAILED, 'INVOICES_SCANNED', 'MANUAL_REVIEW', 'FAILED']:
-            documents = DocumentResult.objects.filter(batch=batch)
-            results = []
-            for doc in documents:
-                results.append({
-                    "id": doc.id,
-                    "filename": doc.original_filename,
-                    "extracted_text": doc.extracted_text,
-                    "processed_at": doc.processed_at,
-                    "reconciliation_status": doc.reconciliation_status,
-                    "reconciliation_details": doc.reconciliation_details,
-                    "matched_bill_data": doc.matched_bill_data,
-                })
-            response_data["results"] = results
+        # ALWAYS fetch and return all the parsed data we have so far, to allow real-time UI updates
+        documents = DocumentResult.objects.filter(batch=batch).order_by('-processed_at')
+        results = []
+        for doc in documents:
+            results.append({
+                "id": doc.id,
+                "filename": doc.original_filename,
+                "extracted_text": doc.extracted_text,
+                "processed_at": doc.processed_at,
+                "reconciliation_status": doc.reconciliation_status,
+                "reconciliation_details": doc.reconciliation_details,
+                "matched_bill_data": doc.matched_bill_data,
+                "audit_trail": doc.audit_trail
+            })
+        response_data["results"] = results
             
         return JsonResponse(response_data)
 
@@ -341,10 +355,169 @@ def get_document_ocr_data(request, document_id):
             "reconciliation_status": document.reconciliation_status,
             "reconciliation_details": document.reconciliation_details,
             "matched_bill_data": document.matched_bill_data,
+            "audit_trail": document.audit_trail
         })
     except DocumentResult.DoesNotExist:
         return JsonResponse({"error": "Document not found"}, status=404)
     except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
+@csrf_exempt
+def update_document_data(request, document_id):
+    """
+    Updates the parsed data of a document (e.g. manual correction of invoice number or amount)
+    and re-triggers the reconciliation process.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+        
+    if request.method != 'POST':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    try:
+        document = DocumentResult.objects.get(pk=document_id)
+        
+        # Verify ownership
+        if document.batch.uploaded_by != request.user:
+            return JsonResponse({"error": "Forbidden"}, status=403)
+
+        data = json.loads(request.body)
+        updates = data.get('updates', {})
+        
+        if not updates:
+             return JsonResponse({"error": "No updates provided"}, status=400)
+
+        # 1. Update the parsed data
+        if document.parsed_data is None:
+            document.parsed_data = {}
+            
+        old_data = document.parsed_data.copy()
+        
+        # We only want to log things that actually changed, and we NEVER want to log the giant tables array
+        changed_details = []
+        actual_changes = {}
+
+        for key, value in updates.items():
+            if key == 'tables':
+                continue # Never log tables
+            
+            old_val = old_data.get(key)
+            if str(old_val) != str(value): # Compare as strings to avoid type issues (e.g. "100" vs 100)
+                actual_changes[key] = {"old": old_val, "new": value}
+                changed_details.append(f"{key}: '{old_val}' -> '{value}'")
+            
+            # Apply the update
+            document.parsed_data[key] = value
+
+        if not actual_changes:
+            return JsonResponse({"message": "No meaningful changes detected.", "document": {"document_id": document.id}}, status=200)
+
+        # 2. Add an audit log entry
+        # Provide more specific details by filtering out non-changes
+        full_name = f"{request.user.first_name} {request.user.last_name}".strip()
+        if not full_name:
+            full_name = request.user.username
+
+        audit_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "action": "Manual Correction",
+            "user_name": full_name,
+            "user_email": request.user.email,
+            "details": " | ".join(changed_details),
+            "changes": actual_changes
+        }
+        
+        # Ensure audit_trail is a list
+        if not isinstance(document.audit_trail, list):
+            document.audit_trail = []
+
+        document.audit_trail.append(audit_entry)
+        
+        # 3. Re-run reconciliation
+        fetched_bills = call_getbills_api(fin_year="2025_2026")
+        
+        ocr_invoice_number = document.parsed_data.get("invoice_number")
+        ocr_total_amount = document.parsed_data.get("total_amount")
+
+        matched_bill = None
+        reconciliation_details = {}
+
+        if ocr_invoice_number:
+            for bill in fetched_bills:
+                if bill.get("invoiceNo") == ocr_invoice_number:
+                    matched_bill = bill
+                    break
+        
+        if matched_bill:
+            document.matched_bill_data = matched_bill
+            api_payable_amount = matched_bill.get("payable")
+
+            if ocr_total_amount is not None and api_payable_amount is not None:
+                try:
+                    ocr_amount_decimal = Decimal(str(ocr_total_amount))
+                    api_amount_decimal = Decimal(str(api_payable_amount))
+
+                    if ocr_amount_decimal == api_amount_decimal:
+                        document.reconciliation_status = ReconciliationStatus.MANUALLY_VERIFIED
+                        reconciliation_details["message"] = "Invoice number and total amount matched after manual correction."
+                    else:
+                        document.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
+                        reconciliation_details["message"] = "Manual correction applied, but total amount still differs."
+                        reconciliation_details["ocr_amount"] = str(ocr_total_amount)
+                        reconciliation_details["api_amount"] = str(api_payable_amount)
+                except InvalidOperation:
+                    document.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
+                    reconciliation_details["message"] = "Manual correction applied, but amount could not be parsed."
+                    reconciliation_details["ocr_amount"] = str(ocr_total_amount)
+                    reconciliation_details["api_amount"] = str(api_payable_amount)
+            else:
+                document.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
+                reconciliation_details["message"] = "Manual correction applied, but amount is missing for comparison."
+        else:
+            document.reconciliation_status = ReconciliationStatus.NO_MATCH
+            reconciliation_details["message"] = "Manual correction applied, but no matching bill found in API."
+            reconciliation_details["ocr_invoice_number"] = ocr_invoice_number
+            reconciliation_details["ocr_total_amount"] = str(ocr_total_amount) if ocr_total_amount is not None else None
+            
+        document.reconciliation_details = reconciliation_details
+        document.save()
+        
+        # 4. Check if the parent batch status needs to be updated
+        batch = document.batch
+        unverified_docs = DocumentResult.objects.filter(
+            batch=batch
+        ).exclude(
+            reconciliation_status__in=[ReconciliationStatus.VERIFIED, ReconciliationStatus.MANUALLY_VERIFIED]
+        ).count()
+        
+        if unverified_docs == 0:
+            batch.status = BatchStatus.COMPLETED
+            batch.save()
+            logger.info(f"Batch {batch.batch_id} fully verified after manual correction.")
+        else:
+            # Revert back to manual review if there are still issues, just in case
+            batch.status = BatchStatus.MANUAL_REVIEW
+            batch.save()
+
+        return JsonResponse({
+            "message": "Document updated and reconciled successfully",
+            "document": {
+                "document_id": document.id,
+                "parsed_data": document.parsed_data,
+                "reconciliation_status": document.reconciliation_status,
+                "reconciliation_details": document.reconciliation_details,
+                "matched_bill_data": document.matched_bill_data,
+                "audit_trail": document.audit_trail
+            },
+            "batch_status": batch.status
+        })
+
+    except DocumentResult.DoesNotExist:
+        return JsonResponse({"error": "Document not found"}, status=404)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    except Exception as e:
+        logger.error(f"Error updating document {document_id}: {e}")
         return JsonResponse({"error": str(e)}, status=500)
 
 
@@ -384,7 +557,7 @@ def get_bills(request):
                     "otherCharges": 0,
                     "paymentStatus": "NOT PAID",
                     "transactionLink": "/TrueBooks/transactionRedirect.do?companyCode=1&tranYear=2025_2026&acType=1&divisionCode=1&locationCode=1&voucherNo=45&isVoucherScr=Y&voucherCode=3&ishqvoucher=1&isdelete=0&invoiceno=234343&operation=VIEW",
-                    "payable": 1083.20,
+                    "payable": 1083.00,
                     "groupName": "Suppliers",
                     "billUniqueId": "45_1_1_1"
                 },
@@ -415,7 +588,7 @@ def get_bills(request):
                     "otherCharges": 0,
                     "paymentStatus": "NOT PAID",
                     "transactionLink": "/TrueBooks/transactionRedirect.do?companyCode=1&tranYear=2025_2026&acType=1&divisionCode=1&locationCode=1&voucherNo=46&isVoucherScr=Y&voucherCode=3&ishqvoucher=1&isdelete=0&invoiceno=3ewe3&operation=VIEW",
-                    "payable": 1306.00,
+                    "payable": 11306.010,
                     "groupName": "Suppliers",
                     "billUniqueId": "46_1_1_1"
                 }

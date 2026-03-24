@@ -13,10 +13,7 @@ class UserProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE)
     role = models.CharField(max_length=20, choices=UserRole.choices, default=UserRole.UNASSIGNED)
     
-    # Store the full claims payload from MSAL if needed for reference
     msal_data = models.JSONField(null=True, blank=True)
-    
-    # Store the user's profile photo as a base64 string
     profile_photo = models.TextField(null=True, blank=True)
 
     def __str__(self):
@@ -60,13 +57,14 @@ class BatchStatus(models.TextChoices):
     PROCESSING = 'INVOICES_SCANNING_IN_PROCESS', 'Invoices Scanning in Process'
     COMPLETED = 'INVOICES_SCANNED', 'Invoices Scanned'
     FAILED = 'FAILED', 'Failed'
-    MANUAL_REVIEW = 'MANUAL_REVIEW', 'Manual Review Needed' # Added MANUAL_REVIEW status
+    MANUAL_REVIEW = 'MANUAL_REVIEW', 'Manual Review Needed'
 
 class ReconciliationStatus(models.TextChoices):
     PENDING = 'PENDING', 'Pending Reconciliation'
     VERIFIED = 'VERIFIED', 'Verified'
     MANUAL_REVIEW = 'MANUAL_REVIEW', 'Manual Review'
     NO_MATCH = 'NO_MATCH', 'No Match Found'
+    MANUALLY_VERIFIED = 'MANUALLY_VERIFIED', 'Manually Verified' # Added for post-correction status
 
 def generate_batch_id():
     """Generates a human-readable batch ID like AP_YYYYMMDD_UUID"""
@@ -75,7 +73,6 @@ def generate_batch_id():
     return f"AP_{date_str}_{short_uuid}"
 
 class OCRBatch(models.Model):
-    # Changed from UUIDField to CharField to support custom string IDs
     batch_id = models.CharField(max_length=50, primary_key=True, default=generate_batch_id, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
@@ -93,14 +90,17 @@ class DocumentResult(models.Model):
     extracted_text = models.TextField(null=True, blank=True)
     parsed_data = models.JSONField(null=True, blank=True)
     
-    # New fields for reconciliation
     reconciliation_status = models.CharField(
         max_length=20,
         choices=ReconciliationStatus.choices,
         default=ReconciliationStatus.PENDING
     )
-    matched_bill_data = models.JSONField(null=True, blank=True) # Stores the matching bill data from the API
-    reconciliation_details = models.JSONField(null=True, blank=True) # Stores reasons for manual review/discrepancies
+    matched_bill_data = models.JSONField(null=True, blank=True)
+    reconciliation_details = models.JSONField(null=True, blank=True) 
+    
+    # Audit log for tracking changes over the document's lifecycle
+    # Format: [{"timestamp": "...", "action": "Scanned", "user": "System", "details": "..."}, ...]
+    audit_trail = models.JSONField(default=list, blank=True)
 
     def __str__(self):
         return f"Doc {self.id} from Batch {self.batch.batch_id} - {self.reconciliation_status}"
