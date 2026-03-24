@@ -19,6 +19,10 @@ const Dashboard = ({ user }) => {
   const [totalPages, setTotalPages] = useState(1);
   const [isFetchingBatches, setIsFetchingBatches] = useState(false);
 
+  // State for Document Modal
+  const [selectedDocument, setSelectedDocument] = useState(null);
+  const [isFetchingDocument, setIsFetchingDocument] = useState(false);
+
   const [notification, setNotification] = useState(null); // { message, type }
 
   // Use a ref to track if we already showed the scanning toast for a specific batch to prevent double-firing
@@ -167,7 +171,7 @@ const Dashboard = ({ user }) => {
   useEffect(() => {
     let pollInterval;
 
-    if (activeBatchId && (!batchStatus || (batchStatus !== 'INVOICES_SCANNED' && batchStatus !== 'FAILED')) && !isUploading) {
+    if (activeBatchId && (!batchStatus || (batchStatus !== 'INVOICES_SCANNED' && batchStatus !== 'FAILED' && batchStatus !== 'MANUAL_REVIEW')) && !isUploading) {
       pollInterval = setInterval(async () => {
         try {
           const response = await fetch(`/api/ocr/status/${activeBatchId}/`);
@@ -186,12 +190,16 @@ const Dashboard = ({ user }) => {
                setUploadProgress(Math.round((data.processed_files / data.total_files) * 100));
             }
 
-            if (data.status === 'INVOICES_SCANNED' || data.status === 'FAILED') {
+            if (data.status === 'INVOICES_SCANNED' || data.status === 'FAILED' || data.status === 'MANUAL_REVIEW' || data.status === 'COMPLETED') {
               clearInterval(pollInterval);
-              if (data.status === 'INVOICES_SCANNED') {
+              if (data.status === 'INVOICES_SCANNED' || data.status === 'COMPLETED') {
                  setBatchData(data.results);
                  fetchRecentBatches(currentPage);
-                 showNotification("Batch processing complete!", "success");
+                 showNotification("Batch processing complete! All documents verified.", "success");
+              } else if (data.status === 'MANUAL_REVIEW') {
+                 setBatchData(data.results);
+                 fetchRecentBatches(currentPage);
+                 showNotification("Batch processed, but some documents require manual review.", "warning");
               } else {
                  showNotification("Batch processing failed.", "error");
               }
@@ -212,7 +220,7 @@ const Dashboard = ({ user }) => {
       setActiveBatchId(batchId);
       setBatchStatus(status);
 
-      if (status === 'INVOICES_SCANNED') {
+      if (status === 'INVOICES_SCANNED' || status === 'MANUAL_REVIEW' || status === 'COMPLETED') { // Added COMPLETED to be safe, though model uses INVOICES_SCANNED usually, tasks uses COMPLETED
           try {
               const response = await fetch(`/api/ocr/status/${batchId}/`);
               const data = await response.json();
@@ -230,6 +238,28 @@ const Dashboard = ({ user }) => {
       }
   };
 
+  const handleDocumentClick = async (documentId) => {
+      setIsFetchingDocument(true);
+      try {
+          const response = await fetch(`/api/ocr/document/${documentId}/`);
+          const data = await response.json();
+          if (response.ok) {
+              setSelectedDocument(data);
+          } else {
+              showNotification(data.error || "Failed to fetch document details.", "error");
+          }
+      } catch (error) {
+          console.error("Error fetching document details:", error);
+          showNotification("An error occurred while fetching document details.", "error");
+      } finally {
+          setIsFetchingDocument(false);
+      }
+  };
+
+  const closeDocumentModal = () => {
+      setSelectedDocument(null);
+  };
+
 
   /* --- UI COMPONENTS --- */
 
@@ -238,11 +268,17 @@ const Dashboard = ({ user }) => {
 
       const isError = notification.type === 'error';
       const isInfo = notification.type === 'info';
+      const isWarning = notification.type === 'warning';
+
+      let bgColor = 'var(--success)';
+      if (isError) bgColor = 'var(--danger)';
+      if (isInfo) bgColor = 'var(--primary-accent)';
+      if (isWarning) bgColor = '#faad14'; // Orange/Yellow
 
       return (
           <div style={{
               position: 'fixed', bottom: '24px', right: '24px', zIndex: 9998,
-              backgroundColor: isError ? 'var(--danger)' : isInfo ? 'var(--primary-accent)' : 'var(--success)',
+              backgroundColor: bgColor,
               color: 'white', padding: '12px 20px', borderRadius: '8px',
               boxShadow: 'var(--shadow-md)', fontWeight: '500',
               display: 'flex', alignItems: 'center', gap: '8px',
@@ -252,6 +288,8 @@ const Dashboard = ({ user }) => {
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
               ) : isInfo ? (
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+              ) : isWarning ? (
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
               ) : (
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
               )}
@@ -390,6 +428,22 @@ const Dashboard = ({ user }) => {
       return new Date(dateStr).toLocaleString();
   };
 
+  const getStatusColor = (status) => {
+      switch (status) {
+          case 'INVOICES_SCANNED':
+          case 'COMPLETED': // Sometimes the task sets it to this
+          case 'VERIFIED':
+              return { bg: 'var(--success-bg)', text: 'var(--success)' };
+          case 'FAILED':
+          case 'NO_MATCH':
+              return { bg: 'var(--danger-bg)', text: 'var(--danger)' };
+          case 'MANUAL_REVIEW':
+              return { bg: '#fffbe6', text: '#faad14' }; // Warning orange/yellow
+          default:
+              return { bg: 'var(--primary-accent-light)', text: 'var(--primary-accent)' };
+      }
+  };
+
   const renderContent = () => {
     switch (role) {
       case 'AP_TEAM':
@@ -518,7 +572,9 @@ const Dashboard = ({ user }) => {
                               </tr>
                           </thead>
                           <tbody style={{ opacity: isFetchingBatches ? 0.5 : 1, transition: 'opacity 0.2s' }}>
-                              {recentBatches.map(batch => (
+                              {recentBatches.map(batch => {
+                                  const colors = getStatusColor(batch.status);
+                                  return (
                                   <tr
                                       key={batch.batch_id}
                                       onClick={() => handleBatchClick(batch.batch_id, batch.status)}
@@ -540,14 +596,14 @@ const Dashboard = ({ user }) => {
                                           <span style={{
                                               padding: '4px 8px',
                                               borderRadius: '12px',
-                                              backgroundColor: batch.status === 'INVOICES_SCANNED' ? 'var(--success-bg)' : batch.status === 'FAILED' ? 'var(--danger-bg)' : 'var(--primary-accent-light)',
-                                              color: batch.status === 'INVOICES_SCANNED' ? 'var(--success)' : batch.status === 'FAILED' ? 'var(--danger)' : 'var(--primary-accent)'
+                                              backgroundColor: colors.bg,
+                                              color: colors.text
                                           }}>
                                               {formatStatus(batch.status)}
                                           </span>
                                       </td>
                                   </tr>
-                              ))}
+                              )})}
                           </tbody>
                       </table>
                   </div>
@@ -598,7 +654,7 @@ const Dashboard = ({ user }) => {
             <h3 style={{ marginTop: 0, color: 'var(--primary-accent)', fontSize: '1.1rem' }}>Batch Details: {activeBatchId}</h3>
 
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem', fontSize: '0.9rem' }}>
-              <span style={{ fontWeight: 'bold', color: 'var(--text-primary)' }}>Status: <span style={{ color: 'var(--primary-accent)'}}>{formatStatus(batchStatus)}</span></span>
+              <span style={{ fontWeight: 'bold', color: 'var(--text-primary)' }}>Status: <span style={{ color: getStatusColor(batchStatus).text}}>{formatStatus(batchStatus)}</span></span>
 
               {/* If uploading to server, we don't show the processing progress here yet */}
               {!isUploading && (
@@ -612,32 +668,244 @@ const Dashboard = ({ user }) => {
                   <div style={{
                     height: '100%',
                     width: `${uploadProgress}%`,
-                    backgroundColor: batchStatus === 'FAILED' ? 'var(--danger)' : batchStatus === 'INVOICES_SCANNED' ? 'var(--success)' : 'var(--primary-accent)',
+                    backgroundColor: batchStatus === 'FAILED' ? 'var(--danger)' : (batchStatus === 'INVOICES_SCANNED' || batchStatus === 'MANUAL_REVIEW' || batchStatus === 'COMPLETED') ? 'var(--success)' : 'var(--primary-accent)',
                     transition: 'width 0.5s ease'
                   }} />
                 </div>
             )}
 
-            {batchStatus === 'INVOICES_SCANNED' && batchData && (
+            {(batchStatus === 'INVOICES_SCANNED' || batchStatus === 'MANUAL_REVIEW' || batchStatus === 'COMPLETED') && batchData && (
               <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--card-border)', paddingTop: '1rem' }}>
-                <h4 style={{ color: 'var(--success)', marginBottom: '0.5rem' }}>Processing Complete!</h4>
+                <h4 style={{ color: batchStatus === 'MANUAL_REVIEW' ? '#faad14' : 'var(--success)', marginBottom: '0.5rem' }}>
+                    {batchStatus === 'MANUAL_REVIEW' ? 'Processing Complete (Review Needed)' : 'Processing Complete!'}
+                </h4>
                 <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>Extracted {batchData.length} documents.</p>
 
-                <div style={{ maxHeight: '300px', overflowY: 'auto', paddingRight: '10px' }}>
-                  {batchData.map((doc) => (
-                    <div key={doc.id} style={{ padding: '1rem', border: '1px solid var(--card-border)', borderRadius: '6px', marginBottom: '0.75rem', backgroundColor: 'var(--background-secondary)' }}>
-                      <strong style={{ fontSize: '0.9rem', display: 'block', color: 'var(--text-primary)', marginBottom: '4px' }}>{doc.filename}</strong>
-                      <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', margin: '0', backgroundColor: 'var(--card-background)', padding: '8px', borderRadius: '4px', border: '1px solid var(--card-border)' }}>
-                        {doc.extracted_text}
-                      </p>
+                <div style={{ maxHeight: '400px', overflowY: 'auto', paddingRight: '10px' }}>
+                  {batchData.map((doc) => {
+                     const docColors = getStatusColor(doc.reconciliation_status);
+                     return (
+                    <div
+                      key={doc.id}
+                      onClick={() => handleDocumentClick(doc.id)}
+                      style={{
+                          padding: '1rem',
+                          border: '1px solid var(--card-border)',
+                          borderRadius: '6px',
+                          marginBottom: '0.75rem',
+                          backgroundColor: 'var(--background-secondary)',
+                          cursor: 'pointer',
+                          transition: 'border-color 0.2s',
+                          borderLeft: `4px solid ${docColors.text}`
+                      }}
+                      onMouseEnter={(e) => e.currentTarget.style.borderColor = 'var(--primary-accent)'}
+                      onMouseLeave={(e) => e.currentTarget.style.borderColor = 'var(--card-border)'}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                          <strong style={{ fontSize: '0.95rem', color: 'var(--text-primary)' }}>{doc.filename}</strong>
+                          <span style={{
+                              fontSize: '0.75rem',
+                              fontWeight: 'bold',
+                              padding: '2px 8px',
+                              borderRadius: '10px',
+                              backgroundColor: docColors.bg,
+                              color: docColors.text
+                          }}>
+                              {formatStatus(doc.reconciliation_status)}
+                          </span>
+                      </div>
+
+                      {doc.reconciliation_status !== 'VERIFIED' && doc.reconciliation_details && doc.reconciliation_details.message && (
+                          <div style={{ fontSize: '0.85rem', color: 'var(--danger)', marginBottom: '8px', padding: '4px', backgroundColor: 'var(--danger-bg)', borderRadius: '4px' }}>
+                              ⚠️ {doc.reconciliation_details.message}
+                              {doc.reconciliation_details.ocr_invoice_number && <span> - OCR Invoice: <b>{doc.reconciliation_details.ocr_invoice_number}</b></span>}
+                              {doc.reconciliation_details.ocr_amount && <span> - OCR Amount: <b>{doc.reconciliation_details.ocr_amount}</b></span>}
+                              {doc.reconciliation_details.api_amount && <span> - API Amount: <b>{doc.reconciliation_details.api_amount}</b></span>}
+                          </div>
+                      )}
                     </div>
-                  ))}
+                  )})}
                 </div>
               </div>
             )}
           </div>
         )}
       </div>
+
+      {/* Document Details Modal */}
+      {selectedDocument && (
+          <div style={{
+              position: 'fixed',
+              top: 0, left: 0, right: 0, bottom: 0,
+              backgroundColor: 'rgba(0, 0, 0, 0.5)',
+              display: 'flex',
+              justifyContent: 'center',
+              alignItems: 'center',
+              zIndex: 10000
+          }} onClick={closeDocumentModal}>
+              <div
+                  style={{
+                      backgroundColor: 'var(--card-background)',
+                      padding: '2rem',
+                      borderRadius: '8px',
+                      width: '80%',
+                      maxWidth: '900px',
+                      maxHeight: '90vh',
+                      overflowY: 'auto',
+                      boxShadow: '0 10px 25px rgba(0,0,0,0.2)',
+                      color: 'var(--text-primary)',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '1rem'
+                  }}
+                  onClick={(e) => e.stopPropagation()} // Prevent clicking inside modal from closing it
+              >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--card-border)', paddingBottom: '1rem' }}>
+                      <h2 style={{ margin: 0 }}>Document Details: {selectedDocument.original_filename}</h2>
+                      <button
+                          onClick={closeDocumentModal}
+                          style={{
+                              background: 'none', border: 'none', fontSize: '1.5rem', cursor: 'pointer', color: 'var(--text-secondary)'
+                          }}
+                      >
+                          &times;
+                      </button>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '2rem', marginTop: '1rem' }}>
+                      {/* Left Column: Parsed Data & API Match */}
+                      <div style={{ flex: 1, minWidth: '400px' }}>
+                          <div style={{ marginBottom: '1.5rem' }}>
+                              <h3 style={{ fontSize: '1.1rem', marginBottom: '0.5rem', color: 'var(--primary-accent)' }}>Extracted Key Fields</h3>
+                              <div style={{ backgroundColor: 'var(--background-secondary)', padding: '1rem', borderRadius: '6px', border: '1px solid var(--card-border)' }}>
+                                  {selectedDocument.parsed_data ? (
+                                      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                                          <tbody>
+                                              {Object.entries(selectedDocument.parsed_data).map(([key, value]) => {
+                                                  // Skip rendering tables here, handle them below
+                                                  if (key === 'tables') return null;
+                                                  return (
+                                                  <tr key={key} style={{ borderBottom: '1px solid var(--card-border)' }}>
+                                                      <td style={{ padding: '8px 4px', fontWeight: 'bold', color: 'var(--text-secondary)', textTransform: 'capitalize' }}>{key.replace('_', ' ')}</td>
+                                                      <td style={{ padding: '8px 4px' }}>{value !== null ? value.toString() : 'N/A'}</td>
+                                                  </tr>
+                                              )})}
+                                          </tbody>
+                                      </table>
+                                  ) : (
+                                      <p style={{ color: 'var(--text-secondary)', margin: 0 }}>No key fields extracted.</p>
+                                  )}
+                              </div>
+                          </div>
+
+                          <div style={{ marginBottom: '1.5rem' }}>
+                              <h3 style={{ fontSize: '1.1rem', marginBottom: '0.5rem', color: 'var(--primary-accent)' }}>Reconciliation Status</h3>
+                              <div style={{
+                                  backgroundColor: getStatusColor(selectedDocument.reconciliation_status).bg,
+                                  padding: '1rem',
+                                  borderRadius: '6px',
+                                  border: `1px solid ${getStatusColor(selectedDocument.reconciliation_status).text}`
+                              }}>
+                                  <strong style={{ color: getStatusColor(selectedDocument.reconciliation_status).text, display: 'block', marginBottom: '4px' }}>
+                                      {formatStatus(selectedDocument.reconciliation_status)}
+                                  </strong>
+                                  {selectedDocument.reconciliation_details && (
+                                      <pre style={{ fontSize: '0.85rem', whiteSpace: 'pre-wrap', wordWrap: 'break-word', color: 'var(--text-primary)', margin: 0 }}>
+                                          {JSON.stringify(selectedDocument.reconciliation_details, null, 2)}
+                                      </pre>
+                                  )}
+                              </div>
+                          </div>
+                      </div>
+
+                      {/* Right Column: Full Text or matched API data */}
+                      <div style={{ flex: 1 }}>
+                         {selectedDocument.matched_bill_data && (
+                              <div style={{ marginBottom: '1.5rem' }}>
+                                  <h3 style={{ fontSize: '1.1rem', marginBottom: '0.5rem', color: 'var(--success)' }}>Matched System Bill Data</h3>
+                                  <div style={{ backgroundColor: 'var(--background-secondary)', padding: '1rem', borderRadius: '6px', border: '1px solid var(--card-border)' }}>
+                                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
+                                          <tbody>
+                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Invoice No:</td><td style={{ padding: '4px' }}>{selectedDocument.matched_bill_data.invoiceNo}</td></tr>
+                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Party Name:</td><td style={{ padding: '4px' }}>{selectedDocument.matched_bill_data.partyName}</td></tr>
+                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Payable:</td><td style={{ padding: '4px', color: 'var(--primary-accent)', fontWeight: 'bold' }}>{selectedDocument.matched_bill_data.payable}</td></tr>
+                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Goods Value:</td><td style={{ padding: '4px' }}>{selectedDocument.matched_bill_data.goodsValue}</td></tr>
+                                              <tr><td style={{ padding: '4px', fontWeight: 'bold' }}>Tax Amount:</td><td style={{ padding: '4px' }}>{selectedDocument.matched_bill_data.taxAmount}</td></tr>
+                                          </tbody>
+                                      </table>
+                                  </div>
+                              </div>
+                          )}
+
+                          <div>
+                              <h3 style={{ fontSize: '1.1rem', marginBottom: '0.5rem', color: 'var(--primary-accent)' }}>Raw Extracted Text</h3>
+                              <div style={{
+                                  backgroundColor: 'var(--background-secondary)',
+                                  padding: '1rem',
+                                  borderRadius: '6px',
+                                  border: '1px solid var(--card-border)',
+                                  maxHeight: '300px',
+                                  overflowY: 'auto',
+                                  fontSize: '0.85rem',
+                                  fontFamily: 'monospace',
+                                  whiteSpace: 'pre-wrap',
+                                  color: 'var(--text-secondary)'
+                              }}>
+                                  {selectedDocument.extracted_text || 'No text extracted.'}
+                              </div>
+                          </div>
+                      </div>
+                  </div>
+
+                  {/* Bottom Row: Extracted Tables */}
+                  {selectedDocument.parsed_data && selectedDocument.parsed_data.tables && selectedDocument.parsed_data.tables.length > 0 && (
+                      <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--card-border)', paddingTop: '1rem' }}>
+                          <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--primary-accent)' }}>Extracted Tables</h3>
+
+                          {selectedDocument.parsed_data.tables.map((table, idx) => {
+                              // Reconstruct the table grid from cells
+                              const grid = Array(table.row_count).fill(null).map(() => Array(table.column_count).fill(""));
+                              table.cells.forEach(cell => {
+                                  if (cell.row_index < table.row_count && cell.column_index < table.column_count) {
+                                      grid[cell.row_index][cell.column_index] = cell.content;
+                                  }
+                              });
+
+                              return (
+                                  <div key={idx} style={{ marginBottom: '2rem', overflowX: 'auto' }}>
+                                      <h4 style={{ fontSize: '0.9rem', marginBottom: '0.5rem', color: 'var(--text-secondary)' }}>Table {idx + 1}</h4>
+                                      <table style={{ width: '100%', borderCollapse: 'collapse', border: '1px solid var(--card-border)' }}>
+                                          <tbody>
+                                              {grid.map((row, rowIndex) => (
+                                                  <tr key={rowIndex}>
+                                                      {row.map((cellContent, colIndex) => (
+                                                          <td
+                                                              key={colIndex}
+                                                              style={{
+                                                                  border: '1px solid var(--card-border)',
+                                                                  padding: '8px',
+                                                                  fontSize: '0.85rem',
+                                                                  backgroundColor: rowIndex === 0 ? 'var(--background-secondary)' : 'transparent',
+                                                                  fontWeight: rowIndex === 0 ? 'bold' : 'normal'
+                                                              }}
+                                                          >
+                                                              {cellContent}
+                                                          </td>
+                                                      ))}
+                                                  </tr>
+                                              ))}
+                                          </tbody>
+                                      </table>
+                                  </div>
+                              );
+                          })}
+                      </div>
+                  )}
+
+              </div>
+          </div>
+      )}
+
     </div>
   );
 };

@@ -60,6 +60,13 @@ class BatchStatus(models.TextChoices):
     PROCESSING = 'INVOICES_SCANNING_IN_PROCESS', 'Invoices Scanning in Process'
     COMPLETED = 'INVOICES_SCANNED', 'Invoices Scanned'
     FAILED = 'FAILED', 'Failed'
+    MANUAL_REVIEW = 'MANUAL_REVIEW', 'Manual Review Needed' # Added MANUAL_REVIEW status
+
+class ReconciliationStatus(models.TextChoices):
+    PENDING = 'PENDING', 'Pending Reconciliation'
+    VERIFIED = 'VERIFIED', 'Verified'
+    MANUAL_REVIEW = 'MANUAL_REVIEW', 'Manual Review'
+    NO_MATCH = 'NO_MATCH', 'No Match Found'
 
 def generate_batch_id():
     """Generates a human-readable batch ID like AP_YYYYMMDD_UUID"""
@@ -84,6 +91,16 @@ class DocumentResult(models.Model):
     original_filename = models.CharField(max_length=500)
     processed_at = models.DateTimeField(auto_now_add=True)
     extracted_text = models.TextField(null=True, blank=True)
+    parsed_data = models.JSONField(null=True, blank=True)
     
+    # New fields for reconciliation
+    reconciliation_status = models.CharField(
+        max_length=20,
+        choices=ReconciliationStatus.choices,
+        default=ReconciliationStatus.PENDING
+    )
+    matched_bill_data = models.JSONField(null=True, blank=True) # Stores the matching bill data from the API
+    reconciliation_details = models.JSONField(null=True, blank=True) # Stores reasons for manual review/discrepancies
+
     def __str__(self):
-        return f"Doc {self.id} from Batch {self.batch.batch_id}"
+        return f"Doc {self.id} from Batch {self.batch.batch_id} - {self.reconciliation_status}"

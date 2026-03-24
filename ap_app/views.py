@@ -12,7 +12,7 @@ from django.contrib.auth.models import User
 from django.views.decorators.csrf import csrf_exempt
 from django.core.files.storage import FileSystemStorage
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
-from .models import UserProfile, UserRole, OCRBatch, DocumentResult, BatchStatus
+from .models import UserProfile, UserRole, OCRBatch, DocumentResult, BatchStatus, ReconciliationStatus
 from .tasks import process_ocr_batch
 
 logger = logging.getLogger(__name__)
@@ -246,8 +246,8 @@ def check_batch_status(request, batch_id):
             "processed_files": batch.processed_files,
         }
 
-        # If completed, fetch and return all the parsed data
-        if batch.status == BatchStatus.COMPLETED:
+        # If completed, manual review, or failed, fetch and return all the parsed data we have so far
+        if str(batch.status) in [BatchStatus.COMPLETED, BatchStatus.MANUAL_REVIEW, BatchStatus.FAILED, 'INVOICES_SCANNED', 'MANUAL_REVIEW', 'FAILED']:
             documents = DocumentResult.objects.filter(batch=batch)
             results = []
             for doc in documents:
@@ -255,7 +255,10 @@ def check_batch_status(request, batch_id):
                     "id": doc.id,
                     "filename": doc.original_filename,
                     "extracted_text": doc.extracted_text,
-                    "processed_at": doc.processed_at
+                    "processed_at": doc.processed_at,
+                    "reconciliation_status": doc.reconciliation_status,
+                    "reconciliation_details": doc.reconciliation_details,
+                    "matched_bill_data": doc.matched_bill_data,
                 })
             response_data["results"] = results
             
@@ -282,16 +285,14 @@ def get_user_batches(request):
         paginator = Paginator(batches, per_page)
         
         try:
-            batches_page = paginator.page(page)
-        except PageNotAnInteger:
-            batches_page = paginator.page(1)
+            batches_page = paginator.page(1) if isinstance(page, str) and not page.isdigit() else paginator.page(page)
         except EmptyPage:
             batches_page = paginator.page(paginator.num_pages)
 
         batch_list = []
         for b in batches_page:
             first_doc_name = None
-            if b.status == BatchStatus.COMPLETED:
+            if str(b.status) in [BatchStatus.COMPLETED, BatchStatus.MANUAL_REVIEW, BatchStatus.FAILED, 'INVOICES_SCANNED', 'MANUAL_REVIEW', 'FAILED']:
                 first_doc = DocumentResult.objects.filter(batch=b).first()
                 if first_doc:
                     first_doc_name = first_doc.original_filename
@@ -318,6 +319,34 @@ def get_user_batches(request):
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=500)
 
+@csrf_exempt
+def get_document_ocr_data(request, document_id):
+    """
+    Returns the full OCR parsed data for a specific DocumentResult ID.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+    
+    try:
+        document = DocumentResult.objects.get(pk=document_id)
+        # Ensure the user owns the batch this document belongs to
+        if document.batch.uploaded_by != request.user:
+            return JsonResponse({"error": "Forbidden"}, status=403)
+            
+        return JsonResponse({
+            "document_id": document.id,
+            "original_filename": document.original_filename,
+            "parsed_data": document.parsed_data,
+            "extracted_text": document.extracted_text,
+            "reconciliation_status": document.reconciliation_status,
+            "reconciliation_details": document.reconciliation_details,
+            "matched_bill_data": document.matched_bill_data,
+        })
+    except DocumentResult.DoesNotExist:
+        return JsonResponse({"error": "Document not found"}, status=404)
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
 
 #do not write below this line
 @csrf_exempt
@@ -339,12 +368,12 @@ def get_bills(request):
                     "partyCode": 10060000046,
                     "partyName": "sup new approved",
                     "voucherType": "Purchase",
-                    "invoiceNo": "234343",
+                    "invoiceNo": "IN18196526016011",
                     "invoiceDate": "2026-03-02 00:00:00",
                     "voucherAmount": 400,
                     "expenseLedger": "Interstate GST28% Purchase",
-                    "goodsValue": 285.71,
-                    "taxAmount": 114.29,
+                    "goodsValue": 1083.20,
+                    "taxAmount": 0,
                     "taxCode": "GST 28%+Cess 12%",
                     "taxType": "IGST",
                     "tdsAmount": 0,
@@ -355,7 +384,7 @@ def get_bills(request):
                     "otherCharges": 0,
                     "paymentStatus": "NOT PAID",
                     "transactionLink": "/TrueBooks/transactionRedirect.do?companyCode=1&tranYear=2025_2026&acType=1&divisionCode=1&locationCode=1&voucherNo=45&isVoucherScr=Y&voucherCode=3&ishqvoucher=1&isdelete=0&invoiceno=234343&operation=VIEW",
-                    "payable": 400,
+                    "payable": 1083.20,
                     "groupName": "Suppliers",
                     "billUniqueId": "45_1_1_1"
                 },
@@ -370,12 +399,12 @@ def get_bills(request):
                     "partyCode": 10060000046,
                     "partyName": "sup new approved",
                     "voucherType": "Purchase",
-                    "invoiceNo": "3ewe3",
+                    "invoiceNo": "IN18196526016009",
                     "invoiceDate": "2026-02-03 00:00:00",
-                    "voucherAmount": 100,
+                    "voucherAmount": 11414.06,
                     "expenseLedger": "Interstate GST28% Purchase",
                     "goodsValue": 34.72,
-                    "taxAmount": 65.28,
+                    "taxAmount": 538.39,
                     "taxCode": "GST 28%+Cess 160%",
                     "taxType": "IGST",
                     "tdsAmount": 0,
@@ -386,7 +415,7 @@ def get_bills(request):
                     "otherCharges": 0,
                     "paymentStatus": "NOT PAID",
                     "transactionLink": "/TrueBooks/transactionRedirect.do?companyCode=1&tranYear=2025_2026&acType=1&divisionCode=1&locationCode=1&voucherNo=46&isVoucherScr=Y&voucherCode=3&ishqvoucher=1&isdelete=0&invoiceno=3ewe3&operation=VIEW",
-                    "payable": 100,
+                    "payable": 1306.00,
                     "groupName": "Suppliers",
                     "billUniqueId": "46_1_1_1"
                 }
