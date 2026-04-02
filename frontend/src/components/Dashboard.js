@@ -1,5 +1,17 @@
 import React, { useRef, useState, useEffect } from 'react';
 
+const DOCUMENT_DETAIL_FIELDS = [
+  { key: 'date', label: 'Date' },
+  { key: 'vendor_name', label: 'Vendor Name' },
+  { key: 'vendor_bank', label: 'Vendor Bank' },
+  { key: 'ifsc_code', label: 'IFSC Code' },
+  { key: 'hsn_or_sac', label: 'HSN or SAC' },
+  { key: 'vendor_gst_number', label: 'GST Number of Vendor' },
+  { key: 'customer_gst_number', label: 'GST Number of Customer' },
+  { key: 'total_amount', label: 'Total Amount' },
+  { key: 'invoice_number', label: 'Invoice Number' },
+];
+
 const Dashboard = ({ user }) => {
   const [role, setRole] = useState(user.role);
   const fileInputRef = useRef(null);
@@ -307,7 +319,8 @@ const Dashboard = ({ user }) => {
           const data = await response.json();
           if (response.ok) {
               showNotification("Document updated and re-verified!", "success");
-              setSelectedDocument(data.document);
+              setSelectedDocument(prev => ({ ...prev, ...data.document }));
+              setEditDocData(data.document.parsed_data || {});
               setIsEditingDoc(false);
 
               if (activeBatchId) {
@@ -323,6 +336,12 @@ const Dashboard = ({ user }) => {
       } finally {
           setIsSavingDoc(false);
       }
+  };
+
+  const getDisplayValue = (value) => {
+      if (value === null || value === undefined) return null;
+      const stringValue = value.toString().trim();
+      return stringValue ? stringValue : null;
   };
 
 
@@ -926,14 +945,14 @@ const Dashboard = ({ user }) => {
                                       ) : selectedDocument.parsed_data ? (
                                           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                                               <tbody>
-                                                  {Object.entries(selectedDocument.parsed_data).map(([key, value]) => {
-                                                      if (key === 'tables') return null;
+                                                  {DOCUMENT_DETAIL_FIELDS.map(({ key, label }) => {
+                                                      const value = getDisplayValue(selectedDocument.parsed_data[key]);
                                                       const isHighlighted = key === 'invoice_number' || key === 'total_amount';
                                                       return (
                                                       <tr key={key} style={{ borderBottom: '1px solid var(--card-border)' }}>
-                                                          <td style={{ padding: '12px 16px', fontWeight: '600', color: 'var(--text-secondary)', textTransform: 'capitalize', width: '40%', backgroundColor: 'rgba(0,0,0,0.02)' }}>{key.replace('_', ' ')}</td>
+                                                          <td style={{ padding: '12px 16px', fontWeight: '600', color: 'var(--text-secondary)', width: '40%', backgroundColor: 'rgba(0,0,0,0.02)' }}>{label}</td>
                                                           <td style={{ padding: '12px 16px', fontWeight: isHighlighted ? 'bold' : 'normal', color: isHighlighted ? 'var(--primary-accent)' : 'var(--text-primary)', fontSize: isHighlighted ? '1.05rem' : '0.95rem' }}>
-                                                              {value !== null ? value.toString() : <span style={{color: 'var(--text-secondary)', fontStyle: 'italic'}}>Missing</span>}
+                                                              {value || <span style={{color: 'var(--text-secondary)', fontStyle: 'italic'}}>Not Available</span>}
                                                           </td>
                                                       </tr>
                                                   )})}

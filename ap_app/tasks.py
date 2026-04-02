@@ -2,16 +2,227 @@ import os
 import time
 import logging
 import json
+import re
 import requests # Import requests for API calls
 from decimal import Decimal, InvalidOperation # For accurate monetary comparisons
 from celery import shared_task
 from django.conf import settings
 from azure.core.credentials import AzureKeyCredential
-from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.ai.formrecognizer import DocumentAnalysisClient, AnalysisFeature
 
 from .models import OCRBatch, DocumentResult, BatchStatus, ReconciliationStatus
 
 logger = logging.getLogger(__name__)
+
+GSTIN_REGEX = re.compile(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]\b", re.IGNORECASE)
+HSN_SAC_CODE_REGEX = re.compile(r"\b\d{4,8}\b")
+
+
+def _normalize_whitespace(value):
+    if value is None:
+        return None
+    normalized = re.sub(r"\s+", " ", str(value)).strip(" :.-")
+    return normalized or None
+
+
+def _find_labeled_value(text, patterns):
+    if not text:
+        return None
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return _normalize_whitespace(match.group(1))
+    return None
+
+
+def _normalize_bank_label(value):
+    if not value:
+        return None
+    value = re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+    return value or None
+
+
+def _clean_account_number(value):
+    if not value:
+        return None
+    cleaned = re.sub(r"[^0-9Xx*]", "", str(value)).upper()
+    digit_count = sum(ch.isdigit() for ch in cleaned)
+    if digit_count < 8 or digit_count > 18:
+        return None
+    return cleaned
+
+
+def _clean_ifsc(value):
+    if not value:
+        return None
+    match = re.search(r"\b([A-Z]{4}0[A-Z0-9]{6})\b", str(value).upper())
+    return match.group(1) if match else None
+
+
+def _extract_vendor_bank_details(key_value_pairs):
+    if not key_value_pairs:
+        logger.info("No Azure key-value pairs available for bank extraction.")
+        return {}
+
+    bank_data = {}
+    bank_candidates = []
+
+    for pair in key_value_pairs:
+        key = _normalize_whitespace(pair.key.content if getattr(pair, "key", None) else None)
+        value = _normalize_whitespace(pair.value.content if getattr(pair, "value", None) else None)
+        confidence = getattr(pair, "confidence", 0) or 0
+
+        if not key or not value or confidence < 0.7:
+            continue
+
+        normalized_key = _normalize_bank_label(key)
+        if not normalized_key:
+            continue
+
+        bank_candidates.append({
+            "key": key,
+            "value": value,
+            "confidence": confidence,
+        })
+
+        if normalized_key in {"bank name", "name of bank", "beneficiary bank", "vendor bank"}:
+            bank_data["bank_name"] = value
+        elif normalized_key in {"ifsc", "ifsc code", "ifs code"}:
+            cleaned_ifsc = _clean_ifsc(value)
+            if cleaned_ifsc:
+                bank_data["ifsc_code"] = cleaned_ifsc
+        elif normalized_key in {"account no", "account number", "a c no", "a c number", "bank a c", "beneficiary account", "beneficiary account no"}:
+            cleaned_account = _clean_account_number(value)
+            if cleaned_account:
+                bank_data["account_number"] = cleaned_account
+        elif normalized_key in {"account holder", "account holder name", "beneficiary name", "name of beneficiary"}:
+            bank_data["account_holder_name"] = value
+        elif normalized_key in {"branch", "branch name", "bank branch"}:
+            bank_data["branch_name"] = value
+        elif normalized_key in {"micr", "micr code"}:
+            bank_data["micr_code"] = value
+        elif normalized_key in {"swift", "swift code"}:
+            bank_data["swift_code"] = value
+
+    has_reliable_bank_identity = any([
+        bank_data.get("bank_name"),
+        bank_data.get("ifsc_code"),
+        bank_data.get("branch_name"),
+        bank_data.get("micr_code"),
+        bank_data.get("swift_code"),
+    ])
+
+    if not has_reliable_bank_identity:
+        logger.info(
+            "Discarded bank details from Azure key-value pairs due to missing reliable bank identity. Candidates=%s Parsed=%s",
+            bank_candidates,
+            bank_data,
+        )
+        return {}
+
+    summary_parts = []
+    for key, label in [
+        ("bank_name", "Bank"),
+        ("account_holder_name", "Account Holder"),
+        ("account_number", "Account No"),
+        ("ifsc_code", "IFSC"),
+        ("branch_name", "Branch"),
+        ("micr_code", "MICR"),
+        ("swift_code", "SWIFT"),
+    ]:
+        value = _normalize_whitespace(bank_data.get(key))
+        if value:
+            summary_parts.append(f"{label}: {value}")
+
+    if summary_parts:
+        bank_data["vendor_bank"] = ", ".join(summary_parts)
+
+    logger.info(
+        "Accepted bank details from Azure key-value pairs. Candidates=%s Parsed=%s",
+        bank_candidates,
+        bank_data,
+    )
+    return bank_data
+
+
+def _extract_hsn_or_sac(text):
+    if not text:
+        return None
+
+    codes = []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    for line in lines:
+        if re.search(r"\b(?:hsn|sac)\b", line, flags=re.IGNORECASE):
+            for match in HSN_SAC_CODE_REGEX.findall(line):
+                if match not in codes:
+                    codes.append(match)
+
+    if not codes:
+        for match in re.finditer(r"\b(?:hsn|sac)\s*(?:code)?\s*[:\-]?\s*([0-9 ,/]{4,200})", text, flags=re.IGNORECASE):
+            for code in HSN_SAC_CODE_REGEX.findall(match.group(1)):
+                if code not in codes:
+                    codes.append(code)
+
+    return ", ".join(codes) if codes else None
+
+
+def _extract_gst_number(text, context_patterns):
+    if not text:
+        return None
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if any(re.search(pattern, line, flags=re.IGNORECASE) for pattern in context_patterns):
+            window = " ".join(lines[max(0, index - 1): min(len(lines), index + 2)])
+            match = GSTIN_REGEX.search(window)
+            if match:
+                return match.group(0).upper()
+
+    return None
+
+
+def enrich_invoice_fields(extracted_data, extracted_text, key_value_pairs=None):
+    enriched_data = dict(extracted_data or {})
+    text = extracted_text or ""
+
+    if not enriched_data.get("vendor_name"):
+        enriched_data["vendor_name"] = _find_labeled_value(text, [
+            r"(?:vendor\s+name|supplier\s+name|seller\s+name)\s*[:\-]?\s*([A-Z0-9&.,()/ \-]{3,100})",
+        ])
+
+    enriched_data.update(_extract_vendor_bank_details(key_value_pairs))
+    enriched_data["hsn_or_sac"] = _extract_hsn_or_sac(text)
+    enriched_data["vendor_gst_number"] = _extract_gst_number(text, [
+        r"\bvendor\b",
+        r"\bsupplier\b",
+        r"\bseller\b",
+        r"\bfrom\b",
+        r"\bconsignor\b",
+        r"\bvendor gst\b",
+        r"\bsupplier gst\b",
+    ])
+    enriched_data["customer_gst_number"] = _extract_gst_number(text, [
+        r"\bcustomer\b",
+        r"\bbuyer\b",
+        r"\brecipient\b",
+        r"\brcvr\b",
+        r"\bbill to\b",
+        r"\bship to\b",
+        r"\bto\b",
+        r"\broyal mart\b",
+    ])
+
+    if not enriched_data.get("vendor_gst_number"):
+        gst_matches = [match.group(0).upper() for match in GSTIN_REGEX.finditer(text)]
+        if len(gst_matches) == 1:
+            enriched_data["vendor_gst_number"] = gst_matches[0]
+        elif len(gst_matches) > 1 and not enriched_data.get("customer_gst_number"):
+            enriched_data["vendor_gst_number"] = gst_matches[0]
+            enriched_data["customer_gst_number"] = gst_matches[1]
+
+    return enriched_data
 
 # Global list to store Azure credentials for round-robin
 AZURE_CREDENTIALS = []
@@ -72,7 +283,9 @@ def extract_data_from_image(file_path, endpoint, key):
 
         with open(file_path, "rb") as f:
             poller = document_analysis_client.begin_analyze_document(
-                "prebuilt-invoice", document=f
+                "prebuilt-invoice",
+                document=f,
+                features=[AnalysisFeature.KEY_VALUE_PAIRS],
             )
         result = poller.result()
 
@@ -120,6 +333,8 @@ def extract_data_from_image(file_path, endpoint, key):
 
         if tables_data:
             extracted_data["tables"] = tables_data
+
+        extracted_data = enrich_invoice_fields(extracted_data, extracted_text, result.key_value_pairs)
 
         return extracted_data, extracted_text
     except Exception as e:
