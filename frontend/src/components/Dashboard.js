@@ -15,10 +15,13 @@ const DOCUMENT_DETAIL_FIELDS = [
 const Dashboard = ({ user }) => {
   const [role, setRole] = useState(user.role);
   const fileInputRef = useRef(null);
+  const dueReportInputRef = useRef(null);
 
   // State for tracking upload progress
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [isDueReportUploading, setIsDueReportUploading] = useState(false);
+  const [dueReport, setDueReport] = useState(null);
 
   // State for tracking processing status
   const [activeBatchId, setActiveBatchId] = useState(null);
@@ -33,7 +36,7 @@ const Dashboard = ({ user }) => {
 
   // State for Document Modal
   const [selectedDocument, setSelectedDocument] = useState(null);
-  const [isFetchingDocument, setIsFetchingDocument] = useState(false);
+  const [, setIsFetchingDocument] = useState(false);
 
   // State for Editing Document
   const [isEditingDoc, setIsEditingDoc] = useState(false);
@@ -47,6 +50,10 @@ const Dashboard = ({ user }) => {
   useEffect(() => {
     fetchRecentBatches(currentPage);
   }, [role, currentPage]);
+
+  useEffect(() => {
+    fetchCurrentDueReport();
+  }, []);
 
   useEffect(() => {
     const handleRoleUpdate = (event) => {
@@ -71,6 +78,21 @@ const Dashboard = ({ user }) => {
       setNotification({ message, type });
   };
 
+  const getCashDiscountDisplay = (cashDiscountData) => {
+    if (!cashDiscountData) {
+      return { percentage: 'Not Available', amountAfterDiscount: 'Not Available' };
+    }
+
+    if (cashDiscountData.match_found === false) {
+      return { percentage: '0', amountAfterDiscount: 'Not Available' };
+    }
+
+    return {
+      percentage: cashDiscountData.cash_discount_percentage != null ? cashDiscountData.cash_discount_percentage : '0',
+      amountAfterDiscount: cashDiscountData.amount_after_discount != null ? cashDiscountData.amount_after_discount : 'Not Available',
+    };
+  };
+
   const fetchRecentBatches = async (pageToFetch = 1) => {
     setIsFetchingBatches(true);
     try {
@@ -90,6 +112,18 @@ const Dashboard = ({ user }) => {
     }
   };
 
+  const fetchCurrentDueReport = async () => {
+    try {
+      const response = await fetch('/api/due-report/current/');
+      const data = await response.json();
+      if (response.ok) {
+        setDueReport(data.due_report || null);
+      }
+    } catch (error) {
+      console.error("Error fetching current due report:", error);
+    }
+  };
+
   const handlePageChange = (newPage) => {
       if (newPage >= 1 && newPage <= totalPages) {
           setCurrentPage(newPage);
@@ -97,10 +131,51 @@ const Dashboard = ({ user }) => {
   };
 
   const handleAction = (actionName) => {
-    if (actionName === "Upload Scanned Copy") {
+    if (actionName === "Upload Due Report") {
+      dueReportInputRef.current.click();
+    } else if (actionName === "Upload Scanned Copy") {
+      if (!dueReport) {
+        showNotification("Upload the due report Excel file first.", "warning");
+        return;
+      }
       fileInputRef.current.click();
     } else {
       showNotification(`Action Triggered: ${actionName}`, "info");
+    }
+  };
+
+  const onDueReportSelected = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    executeDueReportUpload(file);
+  };
+
+  const executeDueReportUpload = async (file) => {
+    setIsDueReportUploading(true);
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const response = await fetch('/api/due-report/upload/', {
+        method: 'POST',
+        body: formData
+      });
+      const data = await response.json();
+
+      if (response.ok) {
+        setDueReport(data.due_report);
+        showNotification(`Due report uploaded: ${data.due_report.row_count} bills loaded.`, "success");
+      } else {
+        showNotification(data.error || "Due report upload failed.", "error");
+      }
+    } catch (error) {
+      console.error("Error uploading due report:", error);
+      showNotification("An error occurred during due report upload.", "error");
+    } finally {
+      setIsDueReportUploading(false);
+      if (dueReportInputRef.current) {
+        dueReportInputRef.current.value = null;
+      }
     }
   };
 
@@ -111,6 +186,11 @@ const Dashboard = ({ user }) => {
   };
 
   const executeFolderUpload = async (files) => {
+    if (!dueReport) {
+      showNotification("Upload the due report Excel file first.", "warning");
+      return;
+    }
+
     setIsUploading(true);
     setUploadProgress(0);
     setBatchStatus(null);
@@ -382,9 +462,9 @@ const Dashboard = ({ user }) => {
       );
   };
 
-  const FeatureCard = ({ iconSvg, title, description, onClick, isComingSoon, variant = 'default' }) => (
+  const FeatureCard = ({ iconSvg, title, description, onClick, isComingSoon, disabled = false, variant = 'default' }) => (
     <div
-      onClick={!isComingSoon && !isUploading ? onClick : undefined}
+      onClick={!isComingSoon && !isUploading && !isDueReportUploading && !disabled ? onClick : undefined}
       style={{
         backgroundColor: 'var(--card-background)',
         padding: '2rem',
@@ -396,19 +476,19 @@ const Dashboard = ({ user }) => {
         minWidth: '250px',
         color: 'var(--text-primary)',
         transition: 'all 0.3s',
-        cursor: (!isComingSoon && onClick && !isUploading) ? 'pointer' : 'default',
+        cursor: (!isComingSoon && onClick && !isUploading && !isDueReportUploading && !disabled) ? 'pointer' : 'default',
         position: 'relative',
-        opacity: (isComingSoon || (isUploading && title === "Upload Scanned Copy")) ? 0.7 : 1,
+        opacity: (isComingSoon || disabled || (isUploading && title === "Upload Scanned Copy") || (isDueReportUploading && title === "Upload Due Report")) ? 0.7 : 1,
         borderColor: variant === 'danger' ? '#ff4d4f' : variant === 'success' ? '#52c41a' : 'var(--card-border)'
       }}
       onMouseEnter={(e) => {
-         if(!isComingSoon && onClick && !isUploading) {
+         if(!isComingSoon && onClick && !isUploading && !isDueReportUploading && !disabled) {
              e.currentTarget.style.transform = 'translateY(-5px)';
              e.currentTarget.style.boxShadow = '0 8px 16px var(--shadow-color)';
          }
       }}
       onMouseLeave={(e) => {
-         if(!isComingSoon && onClick && !isUploading) {
+         if(!isComingSoon && onClick && !isUploading && !isDueReportUploading && !disabled) {
              e.currentTarget.style.transform = 'translateY(0)';
              e.currentTarget.style.boxShadow = '0 2px 4px var(--shadow-color)';
          }
@@ -452,6 +532,12 @@ const Dashboard = ({ user }) => {
               </div>
           </div>
       )}
+
+      {isDueReportUploading && title === "Upload Due Report" && (
+          <div style={{ marginTop: '15px', fontSize: '0.8rem', color: 'var(--primary-accent)', fontWeight: 'bold' }}>
+              Uploading due report...
+          </div>
+      )}
     </div>
   );
 
@@ -459,6 +545,16 @@ const Dashboard = ({ user }) => {
   const FolderIcon = (
     <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
       <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+    </svg>
+  );
+
+  const ReportIcon = (
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+      <polyline points="14 2 14 8 20 8"></polyline>
+      <line x1="8" y1="13" x2="16" y2="13"></line>
+      <line x1="8" y1="17" x2="13" y2="17"></line>
+      <polyline points="9 9 10 10 12 8"></polyline>
     </svg>
   );
 
@@ -557,10 +653,26 @@ const Dashboard = ({ user }) => {
         return (
           <div style={{ display: 'flex', gap: '2rem', justifyContent: 'center', flexWrap: 'wrap' }}>
             <FeatureCard
+              iconSvg={ReportIcon}
+              title="Upload Due Report"
+              description={dueReport ? `${dueReport.filename} (${dueReport.row_count} bills)` : "Upload the due report Excel file before scanning bills."}
+              onClick={() => handleAction("Upload Due Report")}
+              variant={dueReport ? "success" : "default"}
+            />
+            <input
+              type="file"
+              ref={dueReportInputRef}
+              style={{ display: 'none' }}
+              accept=".xlsx"
+              onChange={onDueReportSelected}
+            />
+
+            <FeatureCard
               iconSvg={UploadIcon}
               title="Upload Scanned Copy"
-              description="Select a folder containing scanned invoice copies (PDFs, Images)."
+              description={dueReport ? "Select a folder containing scanned invoice copies (PDFs, Images)." : "Upload the due report first to enable bill scanning."}
               onClick={() => handleAction("Upload Scanned Copy")}
+              disabled={!dueReport}
             />
             <input
               type="file"
@@ -821,7 +933,19 @@ const Dashboard = ({ user }) => {
                               <div style={{ display: 'flex', gap: '16px', color: 'var(--text-primary)' }}>
                                   {doc.reconciliation_details.ocr_invoice_number && <span>OCR Invoice: <b>{doc.reconciliation_details.ocr_invoice_number}</b></span>}
                                   {doc.reconciliation_details.ocr_amount && <span>OCR Amount: <b style={{color: 'var(--danger)'}}>{doc.reconciliation_details.ocr_amount}</b></span>}
-                                  {doc.reconciliation_details.api_amount && <span>System Amount: <b style={{color: 'var(--success)'}}>{doc.reconciliation_details.api_amount}</b></span>}
+                                  {doc.reconciliation_details.api_amount && <span>Due Report Amount: <b style={{color: 'var(--success)'}}>{doc.reconciliation_details.api_amount}</b></span>}
+                                  {doc.reconciliation_details.cash_discount && (() => {
+                                      const discountDisplay = getCashDiscountDisplay(doc.reconciliation_details.cash_discount);
+                                      return (
+                                          <>
+                                              {doc.reconciliation_details.cash_discount.match_found === false && (
+                                                  <span style={{ color: 'var(--warning)' }}>No cash discount rule found for the GST number.</span>
+                                              )}
+                                              <span>Cash Discount: <b style={{color: 'var(--primary-accent)'}}>{discountDisplay.percentage}%</b></span>
+                                              <span>Amount After Discount: <b style={{color: 'var(--success)'}}>{discountDisplay.amountAfterDiscount}</b></span>
+                                          </>
+                                      );
+                                  })()}
                               </div>
                           </div>
                       )}
@@ -964,9 +1088,9 @@ const Dashboard = ({ user }) => {
                                   </div>
                               </div>
 
-                              {/* Matched API Data directly below parsed data for easy comparison */}
+                              {/* Matched due report data directly below parsed data for easy comparison */}
                               <div style={{ marginBottom: '2rem' }}>
-                                  <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--text-primary)', borderBottom: '2px solid var(--success-bg)', paddingBottom: '0.5rem' }}>Matched System Bill Data</h3>
+                                  <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--text-primary)', borderBottom: '2px solid var(--success-bg)', paddingBottom: '0.5rem' }}>Matched Due Report Data</h3>
                                   {selectedDocument.matched_bill_data ? (
                                       <div style={{ backgroundColor: 'var(--background-secondary)', borderRadius: '8px', border: '1px solid var(--card-border)', overflow: 'hidden' }}>
                                           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.95rem' }}>
@@ -975,7 +1099,32 @@ const Dashboard = ({ user }) => {
                                                   <tr style={{ borderBottom: '1px solid var(--card-border)' }}><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Party Name:</td><td style={{ padding: '12px 16px' }}>{selectedDocument.matched_bill_data.partyName}</td></tr>
                                                   <tr style={{ borderBottom: '1px solid var(--card-border)' }}><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Payable:</td><td style={{ padding: '12px 16px', color: 'var(--text-primary)', fontWeight: 'bold', fontSize: '1.05rem' }}>{selectedDocument.matched_bill_data.payable}</td></tr>
                                                   <tr style={{ borderBottom: '1px solid var(--card-border)' }}><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Goods Value:</td><td style={{ padding: '12px 16px' }}>{selectedDocument.matched_bill_data.goodsValue}</td></tr>
-                                                  <tr><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Tax Amount:</td><td style={{ padding: '12px 16px' }}>{selectedDocument.matched_bill_data.taxAmount}</td></tr>
+                                                  <tr style={{ borderBottom: '1px solid var(--card-border)' }}><td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Tax Amount:</td><td style={{ padding: '12px 16px' }}>{selectedDocument.matched_bill_data.taxAmount}</td></tr>
+                                                  {selectedDocument.reconciliation_details?.cash_discount && (() => {
+                                                      const discountDisplay = getCashDiscountDisplay(selectedDocument.reconciliation_details.cash_discount);
+                                                      return (
+                                                          <>
+                                                              <tr style={{ borderBottom: '1px solid var(--card-border)' }}>
+                                                                  <td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>GST Used:</td>
+                                                                  <td style={{ padding: '12px 16px', fontWeight: 'bold' }}>{selectedDocument.reconciliation_details.cash_discount.supplier_gst_number ?? 'Not Available'}</td>
+                                                              </tr>
+                                                              {selectedDocument.reconciliation_details.cash_discount.match_found === false && (
+                                                                  <tr style={{ borderBottom: '1px solid var(--card-border)' }}>
+                                                                      <td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Cash Discount:</td>
+                                                                      <td style={{ padding: '12px 16px', color: 'var(--warning)', fontWeight: 'bold' }}>No matching GST rule found</td>
+                                                                  </tr>
+                                                              )}
+                                                              <tr style={{ borderBottom: '1px solid var(--card-border)' }}>
+                                                                  <td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Cash Discount %:</td>
+                                                                  <td style={{ padding: '12px 16px', color: 'var(--primary-accent)', fontWeight: 'bold' }}>{discountDisplay.percentage}</td>
+                                                              </tr>
+                                                              <tr>
+                                                                  <td style={{ padding: '12px 16px', color: 'var(--text-secondary)', fontWeight: '600', backgroundColor: 'rgba(0,0,0,0.02)' }}>Amount After Discount:</td>
+                                                                  <td style={{ padding: '12px 16px', color: 'var(--success)', fontWeight: 'bold', fontSize: '1.05rem' }}>{discountDisplay.amountAfterDiscount}</td>
+                                                              </tr>
+                                                          </>
+                                                      );
+                                                  })()}
                                               </tbody>
                                           </table>
                                       </div>
@@ -983,7 +1132,7 @@ const Dashboard = ({ user }) => {
                                       <div style={{ backgroundColor: 'var(--background-secondary)', padding: '1.5rem', borderRadius: '8px', border: '1px dashed var(--card-border)' }}>
                                           <p style={{ margin: 0, color: 'var(--text-secondary)', fontWeight: '500', display: 'flex', alignItems: 'center', gap: '8px' }}>
                                               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
-                                              No matching bill found in the system for this invoice number.
+                                              No matching bill found in the due report for this invoice number.
                                           </p>
                                       </div>
                                   )}

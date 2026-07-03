@@ -15,6 +15,10 @@ SECRET_KEY = 'django-insecure-sf$t1)@cv4nh7k=t6+j(g-(m5okmns=icu4g86!mr(e92p2*c3
 
 DEBUG = True
 
+# Toggle debug logging for runtime parsing/diagnostics. Can be set via env var:
+# LOGGER_MODE_DEBUG=1 or LOGGER_MODE_DEBUG=true
+LOGGER_MODE_DEBUG = os.environ.get('LOGGER_MODE_DEBUG', 'True').strip().lower() in ('1', 'true', 'yes')
+
 ALLOWED_HOSTS = []
 
 INSTALLED_APPS = [
@@ -26,6 +30,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'ap_app',
+    'import_export',
 ]
 
 MIDDLEWARE = [
@@ -123,7 +128,7 @@ LOGGING = {
     },
     'root': {
         'handlers': ['console'],
-        'level': 'INFO',
+        'level': 'DEBUG' if LOGGER_MODE_DEBUG else 'INFO',
     },
 }
 

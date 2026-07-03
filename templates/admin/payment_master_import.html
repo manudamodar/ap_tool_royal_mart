@@ -1,0 +1,20 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block content %}
+<div id="content-main">
+  <h1>Import Payment Master Entries</h1>
+  <p>Upload a CSV or Excel file with the payment master columns.</p>
+  <form method="post" enctype="multipart/form-data">
+    {% csrf_token %}
+    <div>
+      <label for="import_file">Choose Excel file (default import format):</label>
+      <input type="file" id="import_file" name="import_file" accept=".xlsx,.xls,.csv" required>
+    </div>
+    <div style="margin-top: 12px;">
+      <button type="submit">Import</button>
+      <a href="{% url 'admin:ap_app_paymentmasterentry_changelist' %}" style="margin-left: 8px;">Back to list</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

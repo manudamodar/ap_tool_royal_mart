@@ -3,7 +3,7 @@ import time
 import logging
 import json
 import re
-import requests # Import requests for API calls
+import requests
 from decimal import Decimal, InvalidOperation # For accurate monetary comparisons
 from celery import shared_task
 from django.conf import settings
@@ -11,6 +11,7 @@ from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient, AnalysisFeature
 
 from .models import OCRBatch, DocumentResult, BatchStatus, ReconciliationStatus
+from .master_data_utils import get_cash_discount_details
 
 logger = logging.getLogger(__name__)
 
@@ -343,7 +344,7 @@ def extract_data_from_image(file_path, endpoint, key):
 
 def call_getbills_api(fin_year="2025_2026"):
     """
-    Calls the local getbills API to fetch payable bills.
+    Calls the local getbills API to fetch payable bills from the uploaded due report.
     """
     api_url = f"http://localhost:8000/api/rest/payable/getbills?finYear={fin_year}"
     try:
@@ -351,7 +352,7 @@ def call_getbills_api(fin_year="2025_2026"):
         response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
         data = response.json()
         if data.get("status") == "success" and "data" in data:
-            logger.info(f"Successfully fetched {len(data['data'])} bills from API for {fin_year}.")
+            logger.info(f"Successfully fetched {len(data['data'])} due report bills for {fin_year}.")
             return data["data"]
         else:
             logger.error(f"API response indicates failure or missing data: {data}")
@@ -366,7 +367,7 @@ def call_getbills_api(fin_year="2025_2026"):
 @shared_task
 def process_ocr_batch(batch_id, folder_path):
     """
-    Background task to process a batch of files, perform OCR, and reconcile with API data.
+    Background task to process a batch of files, perform OCR, and reconcile with due report data.
     """
     logger.info(f"🚀 Started processing batch: {batch_id}. Looking for files in {folder_path}")
     
@@ -386,12 +387,12 @@ def process_ocr_batch(batch_id, folder_path):
         batch.status = BatchStatus.PROCESSING
         batch.save()
 
-        # Fetch all bills from the API once for the entire batch
+        # Fetch all bills from the uploaded due report once for the entire batch
         # Assuming all invoices in a batch belong to the same financial year for now
         # You might need to pass fin_year as a parameter to the task if it varies per batch
-        fetched_bills = call_getbills_api(fin_year="2025_2026")
+        fetched_bills = batch.due_report.data if batch.due_report else call_getbills_api(fin_year="2025_2026")
         if not fetched_bills:
-            logger.warning(f"No bills fetched from API for batch {batch_id}. All documents will be marked as NO_MATCH or MANUAL_REVIEW.")
+            logger.warning(f"No bills fetched from the due report for batch {batch_id}. All documents will be marked as NO_MATCH or MANUAL_REVIEW.")
 
         for root, _, files in os.walk(folder_path):
             total_in_folder = len(files)
@@ -431,7 +432,7 @@ def process_ocr_batch(batch_id, folder_path):
                     reconciliation_details = {}
 
                     if ocr_invoice_number:
-                        # Find a matching bill from the API data
+                        # Find a matching bill from the due report data
                         for bill in fetched_bills:
                             if bill.get("invoiceNo") == ocr_invoice_number:
                                 matched_bill = bill
@@ -440,6 +441,11 @@ def process_ocr_batch(batch_id, folder_path):
                     if matched_bill:
                         document_result.matched_bill_data = matched_bill
                         api_payable_amount = matched_bill.get("payable")
+                        cash_discount_details = get_cash_discount_details(
+                            parsed_data=extracted_data,
+                            matched_bill_data=matched_bill,
+                        )
+                        reconciliation_details["cash_discount"] = cash_discount_details
 
                         if ocr_total_amount is not None and api_payable_amount is not None:
                             try:
@@ -456,7 +462,7 @@ def process_ocr_batch(batch_id, folder_path):
                                     reconciliation_details["message"] = "Invoice number matched, but total amount differs."
                                     reconciliation_details["ocr_amount"] = str(ocr_total_amount)
                                     reconciliation_details["api_amount"] = str(api_payable_amount)
-                                    logger.warning(f"File {file_name}: {reconciliation_details['message']} (OCR: {ocr_total_amount}, API: {api_payable_amount})")
+                                    logger.warning(f"File {file_name}: {reconciliation_details['message']} (OCR: {ocr_total_amount}, Due Report: {api_payable_amount})")
                             except InvalidOperation:
                                 document_result.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
                                 reconciliation_summary[ReconciliationStatus.MANUAL_REVIEW] += 1
@@ -467,14 +473,14 @@ def process_ocr_batch(batch_id, folder_path):
                         else:
                             document_result.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
                             reconciliation_summary[ReconciliationStatus.MANUAL_REVIEW] += 1
-                            reconciliation_details["message"] = "Invoice number matched, but OCR or API total amount was missing for comparison."
+                            reconciliation_details["message"] = "Invoice number matched, but OCR or due report total amount was missing for comparison."
                             reconciliation_details["ocr_amount"] = str(ocr_total_amount)
                             reconciliation_details["api_amount"] = str(api_payable_amount)
                             logger.warning(f"File {file_name}: {reconciliation_details['message']}")
                     else:
                         document_result.reconciliation_status = ReconciliationStatus.NO_MATCH
                         reconciliation_summary[ReconciliationStatus.NO_MATCH] += 1
-                        reconciliation_details["message"] = "No matching bill found in API data for OCR invoice number."
+                        reconciliation_details["message"] = "No matching bill found in due report data for OCR invoice number."
                         reconciliation_details["ocr_invoice_number"] = ocr_invoice_number
                         reconciliation_details["ocr_total_amount"] = str(ocr_total_amount) if ocr_total_amount is not None else None
                         logger.warning(f"File {file_name}: {reconciliation_details['message']} (OCR Invoice: {ocr_invoice_number})")

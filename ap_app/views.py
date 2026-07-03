@@ -1,9 +1,12 @@
 import os
 import json
+import re
 import msal
 import logging
 import requests
 import base64
+import math
+import pandas as pd
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from django.conf import settings
@@ -11,13 +14,353 @@ from django.shortcuts import redirect
 from django.http import JsonResponse
 from django.contrib.auth import login, logout
 from django.contrib.auth.models import User
+from django.db import transaction
 from django.views.decorators.csrf import csrf_exempt
 from django.core.files.storage import FileSystemStorage
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
-from .models import UserProfile, UserRole, OCRBatch, DocumentResult, BatchStatus, ReconciliationStatus
+from .models import (
+    UserProfile,
+    UserRole,
+    OCRBatch,
+    DocumentResult,
+    BatchStatus,
+    ReconciliationStatus,
+    DueReportUpload,
+    DueReportInvoiceWise,
+    DueReportUnknown,
+)
 from .tasks import process_ocr_batch, call_getbills_api
+from .master_data_utils import get_cash_discount_details
 
 logger = logging.getLogger(__name__)
+
+GET_BILLS_DEFAULTS = {
+    "tranYear": "",
+    "branchCode": None,
+    "branchName": "",
+    "voucherNo": "",
+    "voucherDate": "",
+    "billRefNo": "",
+    "billDate": "",
+    "partyCode": None,
+    "partyName": "",
+    "voucherType": "",
+    "invoiceNo": "",
+    "invoiceDate": "",
+    "voucherAmount": 0,
+    "expenseLedger": "",
+    "goodsValue": 0,
+    "taxAmount": 0,
+    "taxCode": "",
+    "taxType": "",
+    "tdsAmount": 0,
+    "tdsSection": " ",
+    "dueDays": 0,
+    "dueDate": "",
+    "payMode": "",
+    "otherCharges": 0,
+    "paymentStatus": "NOT PAID",
+    "transactionLink": "",
+    "payable": 0,
+    "groupName": "",
+    "billUniqueId": "",
+}
+
+COLUMN_ALIASES = {
+    "tranyear": "tranYear",
+    "branchcode": "branchCode",
+    "branchname": "branchName",
+    "locationname": "branchName",
+    "voucherno": "voucherNo",
+    "voucherdate": "voucherDate",
+    "billvoucherdate": "voucherDate",
+    "billrefno": "billRefNo",
+    "refno": "billRefNo",
+    "billdate": "billDate",
+    "partycode": "partyCode",
+    "partyname": "partyName",
+    "suppliername": "partyName",
+    "vouchertype": "voucherType",
+    "invoiceno": "invoiceNo",
+    "invoicedate": "invoiceDate",
+    "voucheramount": "voucherAmount",
+    "billamount": "voucherAmount",
+    "expenseledger": "expenseLedger",
+    "goodsvalue": "goodsValue",
+    "taxamount": "taxAmount",
+    "taxcode": "taxCode",
+    "taxtype": "taxType",
+    "msmetype": "taxType",
+    "payable": "payable",
+    "groupname": "groupName",
+    "billuniqueid": "billUniqueId",
+    "balanceamount": "payable",
+    "netbalance": "payable",
+    "discamount": "otherCharges",
+    "amountadjusted": "otherCharges",
+    "pendingadjamt": "otherCharges",
+    "noofdays": "dueDays",
+    "duedate": "dueDate",
+    "overduedays": "dueDays",
+    "priordate": "dueDate",
+}
+
+DUE_REPORT_STORAGE_COLUMN_ALIASES = {
+    "locationname": "location_name",
+    "suppliername": "supplier_name",
+    "partyname": "supplier_name",
+    "supplier": "supplier_name",
+    "vendorname": "supplier_name",
+    "vendor": "supplier_name",
+    # GST / tax identifiers
+    "gstin": "gst_number",
+    "gstnumber": "gst_number",
+    "suppliergstnumber": "gst_number",
+    "suppliergstno": "gst_number",
+    "invoiceno": "invoice_no",
+    "refno": "ref_no",
+    "billvoucherdate": "bill_voucher_date",
+    "voucherdate": "bill_voucher_date",
+    "invoicedate": "invoice_date",
+    "billamount": "bill_amount",
+    "discamount": "disc_amount",
+    "amountadjusted": "amount_adjusted",
+    "balanceamount": "balance_amount",
+    "pendingadjamt": "pending_adj_amt",
+    "netbalance": "net_balance",
+    "noofdays": "no_of_days",
+    "duedate": "due_date",
+    "overduedays": "over_due_days",
+    "priordate": "prior_date",
+    "groupname": "group_name",
+    "vouchertype": "voucher_type",
+    "msmetype": "msme_type",
+}
+
+DUE_REPORT_STORAGE_FIELDS = (
+    "location_name",
+    "supplier_name",
+    "gst_number",
+    "invoice_no",
+    "ref_no",
+    "bill_voucher_date",
+    "invoice_date",
+    "bill_amount",
+    "disc_amount",
+    "amount_adjusted",
+    "balance_amount",
+    "pending_adj_amt",
+    "net_balance",
+    "no_of_days",
+    "due_date",
+    "over_due_days",
+    "prior_date",
+    "group_name",
+    "voucher_type",
+    "msme_type",
+)
+
+GSTIN_PATTERN = re.compile(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b", re.IGNORECASE)
+
+
+def _normalize_header_name(value):
+    if value is None:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
+def _json_safe_excel_value(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d 00:00:00")
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d 00:00:00")
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return round(value, 3)
+    return value
+
+
+def _normalize_numeric_value(value):
+    safe_value = _json_safe_excel_value(value)
+    if safe_value is None:
+        return None
+    if isinstance(safe_value, str):
+        cleaned = safe_value.strip().replace(",", "")
+        try:
+            return float(cleaned)
+        except ValueError:
+            return safe_value
+    if isinstance(safe_value, (int, float)):
+        return float(safe_value)
+    return safe_value
+
+
+def _normalize_date_value(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d 00:00:00")
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d 00:00:00")
+    if isinstance(value, (int, float)):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        try:
+            return pd.to_datetime(value, unit="D").strftime("%Y-%m-%d 00:00:00")
+        except Exception:
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = pd.to_datetime(text, errors="coerce")
+            if pd.notna(parsed):
+                return parsed.strftime("%Y-%m-%d 00:00:00")
+        except Exception:
+            pass
+        for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y", "%d-%m-%Y"):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                return parsed.strftime("%Y-%m-%d 00:00:00")
+            except ValueError:
+                continue
+    return _json_safe_excel_value(value)
+
+
+def _excel_value_to_text(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        if value.is_integer():
+            return str(int(value))
+    return str(value).strip()
+
+
+def _extract_gst_from_supplier_name(supplier_name):
+    if not supplier_name:
+        return supplier_name, ""
+
+    supplier_text = str(supplier_name).strip()
+    match = GSTIN_PATTERN.search(supplier_text)
+    if not match:
+        return supplier_text, ""
+
+    gst_number = match.group(0).upper()
+    cleaned_supplier_name = f"{supplier_text[:match.start()]} {supplier_text[match.end():]}"
+    cleaned_supplier_name = re.sub(r"\s+", " ", cleaned_supplier_name).strip()
+    return cleaned_supplier_name, gst_number
+
+
+def _parse_due_report_storage_rows(file_obj):
+    df = pd.read_excel(file_obj)
+    df = df.dropna(how="all")
+
+    rows = []
+    for _, row in df.iterrows():
+        stored_row = {field: None for field in DUE_REPORT_STORAGE_FIELDS}
+        for column, value in row.items():
+            target_key = DUE_REPORT_STORAGE_COLUMN_ALIASES.get(_normalize_header_name(column))
+            if not target_key:
+                continue
+            stored_row[target_key] = _excel_value_to_text(value)
+
+        if any(value not in (None, "") for value in stored_row.values()):
+            rows.append(stored_row)
+
+    return rows
+
+
+def _persist_due_report_rows(due_report, rows, uploaded_by):
+    invoice_wise_rows = []
+    unknown_rows = []
+
+    for row in rows:
+        original_supplier_name = row.get("supplier_name")
+        cleaned_supplier_name, gst_number = _extract_gst_from_supplier_name(original_supplier_name)
+        invoice_no = (row.get("invoice_no") or "").strip()
+
+        row_data = row.copy()
+        row_data["gst_number"] = gst_number or None
+        row_data["supplier_name"] = cleaned_supplier_name
+
+        base_data = {
+            **row_data,
+            "due_report": due_report,
+            "uploaded_by": uploaded_by,
+            "is_from_excel": True,
+            "is_from_api": False,
+        }
+
+        if invoice_no and gst_number:
+            invoice_wise_rows.append(DueReportInvoiceWise(**base_data))
+        else:
+            unknown_rows.append(DueReportUnknown(
+                **base_data,
+                status="MANUAL_REVIEW",
+            ))
+
+    if invoice_wise_rows:
+        DueReportInvoiceWise.objects.bulk_create(invoice_wise_rows)
+    if unknown_rows:
+        DueReportUnknown.objects.bulk_create(unknown_rows)
+
+    return len(invoice_wise_rows), len(unknown_rows)
+
+
+def _parse_due_report_excel(file_obj):
+    df = pd.read_excel(file_obj)
+    df = df.dropna(how="all")
+
+    rows = []
+    for _, row in df.iterrows():
+        bill = GET_BILLS_DEFAULTS.copy()
+        for column, value in row.items():
+            target_key = COLUMN_ALIASES.get(_normalize_header_name(column))
+            if not target_key:
+                continue
+
+            if target_key in {"voucherDate", "invoiceDate", "dueDate", "billDate"}:
+                bill[target_key] = _normalize_date_value(value)
+            elif target_key in {"voucherAmount", "goodsValue", "taxAmount", "payable", "otherCharges", "dueDays"}:
+                bill[target_key] = _normalize_numeric_value(value)
+            else:
+                bill[target_key] = _json_safe_excel_value(value)
+
+        if not bill.get("dueDate") and bill.get("invoiceDate"):
+            bill["dueDate"] = bill["invoiceDate"]
+
+        if isinstance(bill.get("invoiceNo"), str):
+            bill["invoiceNo"] = bill["invoiceNo"].strip()
+
+        if bill.get("invoiceNo"):
+            rows.append(bill)
+
+    return rows
 
 def get_msal_app():
     return msal.ConfidentialClientApplication(
@@ -194,6 +537,90 @@ def change_user_role(request):
 # --- OCR Workflow Views ---
 
 @csrf_exempt
+def upload_due_report(request):
+    """
+    Uploads the due report workbook that becomes the source for GetBills
+    reconciliation data.
+    """
+    if request.method != 'POST':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    report_file = request.FILES.get('file')
+    if not report_file:
+        return JsonResponse({"error": "No due report file provided"}, status=400)
+
+    filename = os.path.basename(report_file.name)
+    if not filename.lower().endswith(".xlsx"):
+        return JsonResponse({"error": "Please upload an Excel due report file (.xlsx)."}, status=400)
+
+    try:
+        rows = _parse_due_report_excel(report_file)
+        report_file.seek(0)
+        storage_rows = _parse_due_report_storage_rows(report_file)
+    except Exception as e:
+        logger.error(f"Failed to parse due report {filename}: {e}")
+        return JsonResponse({"error": f"Unable to parse due report: {e}"}, status=400)
+
+    if not rows and not storage_rows:
+        return JsonResponse({"error": "No bill rows were found in the due report."}, status=400)
+
+    with transaction.atomic():
+        due_report = DueReportUpload.objects.create(
+            original_filename=filename,
+            uploaded_by=request.user,
+            row_count=len(storage_rows),
+            data=rows,
+        )
+        invoice_wise_count, unknown_count = _persist_due_report_rows(
+            due_report=due_report,
+            rows=storage_rows,
+            uploaded_by=request.user,
+        )
+
+    # Debug logging controlled by settings.LOGGER_MODE_DEBUG
+    if getattr(settings, 'LOGGER_MODE_DEBUG', False):
+        logger.debug("Due report parsed: filename=%s, parsed_rows=%d, storage_rows=%d", filename, len(rows), len(storage_rows))
+        try:
+            logger.debug("Parsed rows sample: %s", rows[:10])
+            logger.debug("Storage rows sample: %s", storage_rows[:10])
+        except Exception:
+            logger.debug("Parsed/storage rows contain non-serializable items; skipping sample output")
+
+    return JsonResponse({
+        "message": "Due report uploaded successfully",
+        "due_report": {
+            "id": due_report.id,
+            "filename": due_report.original_filename,
+            "uploaded_at": due_report.uploaded_at,
+            "row_count": due_report.row_count,
+            "invoice_wise_count": invoice_wise_count,
+            "unknown_count": unknown_count,
+        }
+    }, status=201)
+
+
+def get_current_due_report(request):
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    due_report = DueReportUpload.objects.filter(uploaded_by=request.user).order_by('-uploaded_at').first()
+    if not due_report:
+        return JsonResponse({"due_report": None})
+
+    return JsonResponse({
+        "due_report": {
+            "id": due_report.id,
+            "filename": due_report.original_filename,
+            "uploaded_at": due_report.uploaded_at,
+            "row_count": due_report.row_count,
+        }
+    })
+
+
+@csrf_exempt
 def upload_batch(request):
     """
     Phase 1: API Ingestion
@@ -210,9 +637,14 @@ def upload_batch(request):
     if not files:
         return JsonResponse({"error": "No files provided"}, status=400)
 
+    due_report = DueReportUpload.objects.filter(uploaded_by=request.user).order_by('-uploaded_at').first()
+    if not due_report:
+        return JsonResponse({"error": "Please upload the due report Excel file before uploading bills."}, status=400)
+
     # 1. Create the Batch Database record
     batch = OCRBatch.objects.create(
         uploaded_by=request.user,
+        due_report=due_report,
         status=BatchStatus.PENDING,
         total_files=len(files)
     )
@@ -258,6 +690,11 @@ def check_batch_status(request, batch_id):
             "status": batch.status,
             "total_files": batch.total_files,
             "processed_files": batch.processed_files,
+            "due_report": {
+                "id": batch.due_report.id,
+                "filename": batch.due_report.original_filename,
+                "row_count": batch.due_report.row_count,
+            } if batch.due_report else None,
         }
 
         # ALWAYS fetch and return all the parsed data we have so far, to allow real-time UI updates
@@ -317,6 +754,7 @@ def get_user_batches(request):
                 "status": b.status,
                 "total_files": b.total_files,
                 "processed_files": b.processed_files,
+                "due_report_filename": b.due_report.original_filename if b.due_report else None,
                 "representative_file": first_doc_name
             })
             
@@ -434,7 +872,7 @@ def update_document_data(request, document_id):
         document.audit_trail.append(audit_entry)
         
         # 3. Re-run reconciliation
-        fetched_bills = call_getbills_api(fin_year="2025_2026")
+        fetched_bills = document.batch.due_report.data if document.batch.due_report else call_getbills_api(fin_year="2025_2026")
         
         ocr_invoice_number = document.parsed_data.get("invoice_number")
         ocr_total_amount = document.parsed_data.get("total_amount")
@@ -451,6 +889,11 @@ def update_document_data(request, document_id):
         if matched_bill:
             document.matched_bill_data = matched_bill
             api_payable_amount = matched_bill.get("payable")
+            cash_discount_details = get_cash_discount_details(
+                parsed_data=document.parsed_data,
+                matched_bill_data=matched_bill,
+            )
+            reconciliation_details["cash_discount"] = cash_discount_details
 
             if ocr_total_amount is not None and api_payable_amount is not None:
                 try:
@@ -462,20 +905,20 @@ def update_document_data(request, document_id):
                         reconciliation_details["message"] = "Invoice number and total amount matched after manual correction."
                     else:
                         document.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
-                        reconciliation_details["message"] = "Manual correction applied, but total amount still differs."
+                        reconciliation_details["message"] = "Manual correction applied, but total amount still differs from the due report."
                         reconciliation_details["ocr_amount"] = str(ocr_total_amount)
                         reconciliation_details["api_amount"] = str(api_payable_amount)
                 except InvalidOperation:
                     document.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
-                    reconciliation_details["message"] = "Manual correction applied, but amount could not be parsed."
+                    reconciliation_details["message"] = "Manual correction applied, but amount could not be parsed for due report comparison."
                     reconciliation_details["ocr_amount"] = str(ocr_total_amount)
                     reconciliation_details["api_amount"] = str(api_payable_amount)
             else:
                 document.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
-                reconciliation_details["message"] = "Manual correction applied, but amount is missing for comparison."
+                reconciliation_details["message"] = "Manual correction applied, but amount is missing for due report comparison."
         else:
             document.reconciliation_status = ReconciliationStatus.NO_MATCH
-            reconciliation_details["message"] = "Manual correction applied, but no matching bill found in API."
+            reconciliation_details["message"] = "Manual correction applied, but no matching bill found in the due report."
             reconciliation_details["ocr_invoice_number"] = ocr_invoice_number
             reconciliation_details["ocr_total_amount"] = str(ocr_total_amount) if ocr_total_amount is not None else None
             
@@ -525,76 +968,29 @@ def update_document_data(request, document_id):
 @csrf_exempt
 def get_bills(request):
     if request.method == 'GET':
-        # Contract API response for GetBills
-        data = {
+        due_report = DueReportUpload.objects.order_by('-uploaded_at').first()
+        if not due_report:
+            return JsonResponse({
+                "status": "success",
+                "message": "No due report uploaded yet",
+                "data": []
+            })
+
+        fin_year = request.GET.get('finYear')
+        bills = due_report.data or []
+        if fin_year:
+            bills = [bill for bill in bills if str(bill.get("tranYear")) == str(fin_year)]
+
+        return JsonResponse({
             "status": "success",
             "message": "success",
-            "data": [
-                {
-                    "tranYear": "2025_2026",
-                    "branchCode": 1,
-                    "branchName": "AEOC RPOS6",
-                    "voucherNo": "2025_2026_52_1_1",
-                    "voucherDate": "2026-03-02 00:00:00",
-                    "billRefNo": "HO-PU17",
-                    "billDate": "2026-03-02 00:00:00",
-                    "partyCode": 10060000046,
-                    "partyName": "sup new approved",
-                    "voucherType": "Purchase",
-                    "invoiceNo": "IN18196526016011",
-                    "invoiceDate": "2026-03-02 00:00:00",
-                    "voucherAmount": 400,
-                    "expenseLedger": "Interstate GST28% Purchase",
-                    "goodsValue": 1083.20,
-                    "taxAmount": 0,
-                    "taxCode": "GST 28%+Cess 12%",
-                    "taxType": "IGST",
-                    "tdsAmount": 0,
-                    "tdsSection": " ",
-                    "dueDays": 0,
-                    "dueDate": "2026-03-02 00:00:00",
-                    "payMode": "Bank",
-                    "otherCharges": 0,
-                    "paymentStatus": "NOT PAID",
-                    "transactionLink": "/TrueBooks/transactionRedirect.do?companyCode=1&tranYear=2025_2026&acType=1&divisionCode=1&locationCode=1&voucherNo=45&isVoucherScr=Y&voucherCode=3&ishqvoucher=1&isdelete=0&invoiceno=234343&operation=VIEW",
-                    "payable": 1083.00,
-                    "groupName": "Suppliers",
-                    "billUniqueId": "45_1_1_1"
-                },
-                {
-                    "tranYear": "2025_2026",
-                    "branchCode": 1,
-                    "branchName": "AEOC RPOS6",
-                    "voucherNo": "2025_2026_53_1_1",
-                    "voucherDate": "2026-03-02 00:00:00",
-                    "billRefNo": "HO-PU18",
-                    "billDate": "2026-03-02 00:00:00",
-                    "partyCode": 10060000046,
-                    "partyName": "sup new approved",
-                    "voucherType": "Purchase",
-                    "invoiceNo": "IN18196526016009",
-                    "invoiceDate": "2026-02-03 00:00:00",
-                    "voucherAmount": 11414.06,
-                    "expenseLedger": "Interstate GST28% Purchase",
-                    "goodsValue": 34.72,
-                    "taxAmount": 538.39,
-                    "taxCode": "GST 28%+Cess 160%",
-                    "taxType": "IGST",
-                    "tdsAmount": 0,
-                    "tdsSection": " ",
-                    "dueDays": 0,
-                    "dueDate": "2026-02-03 00:00:00",
-                    "payMode": "Bank",
-                    "otherCharges": 0,
-                    "paymentStatus": "NOT PAID",
-                    "transactionLink": "/TrueBooks/transactionRedirect.do?companyCode=1&tranYear=2025_2026&acType=1&divisionCode=1&locationCode=1&voucherNo=46&isVoucherScr=Y&voucherCode=3&ishqvoucher=1&isdelete=0&invoiceno=3ewe3&operation=VIEW",
-                    "payable": 11306.010,
-                    "groupName": "Suppliers",
-                    "billUniqueId": "46_1_1_1"
-                }
-            ]
-        }
-        return JsonResponse(data)
+            "source": {
+                "due_report_id": due_report.id,
+                "filename": due_report.original_filename,
+                "uploaded_at": due_report.uploaded_at,
+            },
+            "data": bills
+        })
     return JsonResponse({"error": "Method not allowed"}, status=405)
 
 @csrf_exempt

@@ -11,6 +11,8 @@ urlpatterns = [
     path('auth/change_role/', views.change_user_role, name='change_user_role'),
 
     # OCR Endpoints
+    path('due-report/upload/', views.upload_due_report, name='upload_due_report'),
+    path('due-report/current/', views.get_current_due_report, name='get_current_due_report'),
     path('ocr/upload/', views.upload_batch, name='upload_batch'),
     # Changed from <uuid:batch_id> to <str:batch_id> to support our custom string format
     path('ocr/status/<str:batch_id>/', views.check_batch_status, name='check_batch_status'),
