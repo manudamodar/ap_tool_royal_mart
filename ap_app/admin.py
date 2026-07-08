@@ -4,6 +4,7 @@ from django.contrib import admin
 from django.http import HttpResponse
 from django.shortcuts import redirect, render
 from django.urls import path, reverse
+from django.utils.html import format_html
 from .models import (
     UserProfile,
     Vendor,
@@ -46,10 +47,14 @@ def _read_import_rows(uploaded_file):
 
 @admin.register(UserProfile)
 class UserProfileAdmin(admin.ModelAdmin):
-    list_display = ('user', 'role', 'get_email', 'get_first_name', 'get_last_login')
+    list_display = ('user', 'role', 'get_account_manager', 'get_email', 'get_first_name', 'get_last_login')
     list_filter = ('role',)
-    search_fields = ('user__username', 'user__email', 'user__first_name')
+    search_fields = ('user__username', 'user__email', 'user__first_name', 'account_manager__username', 'account_manager__email')
     readonly_fields = ('msal_data', 'profile_photo')
+
+    def get_account_manager(self, obj):
+        return obj.account_manager.username if obj.account_manager else None
+    get_account_manager.short_description = 'Account Manager'
 
     def get_email(self, obj):
         return obj.user.email
@@ -191,7 +196,8 @@ class DueReportRowAdmin(admin.ModelAdmin):
 
 @admin.register(DueReportInvoiceWise)
 class DueReportInvoiceWiseAdmin(DueReportRowAdmin):
-    pass
+    list_display = DueReportRowAdmin.list_display + ('is_acknowledged', 'is_payment_file_created', 'manager_rejected', 'manager_rejected_by')
+    readonly_fields = DueReportRowAdmin.readonly_fields + ('is_acknowledged', 'is_payment_file_created', 'manager_rejected', 'manager_rejected_by', 'manager_rejection_reason', 'manager_rejected_at')
 
 
 @admin.register(DueReportUnknown)
@@ -314,17 +320,24 @@ class PaymentFileAdmin(admin.ModelAdmin):
     )
     list_filter = ("status", "created_at", "created_by", "modified_by")
     search_fields = ("id", "unique_id", "due_report__original_filename", "created_by__username", "modified_by__username")
-    readonly_fields = ("id", "unique_id", "created_by", "modified_by", "created_at", "updated_at")
+    readonly_fields = ("id", "unique_id", "created_by", "modified_by", "created_at", "updated_at", "download_link", "line_item_overrides", "rejected_due_report_row_ids")
     ordering = ("-created_at",)
 
     fieldsets = (
         ("Payment File", {
-            "fields": ("id", "unique_id", "due_report", "status", "total_files", "processed_files")
+            "fields": ("id", "unique_id", "due_report", "status", "total_files", "processed_files", "download_link", "line_item_overrides", "rejected_due_report_row_ids")
         }),
         ("Audit", {
             "fields": ("created_by", "modified_by", "created_at", "updated_at")
         }),
     )
+
+    def download_link(self, obj):
+        if not obj.pk:
+            return "-"
+        url = reverse('download_payment_file', args=[obj.pk])
+        return format_html('<a href="{}" target="_blank">Download XLSX</a>', url)
+    download_link.short_description = "Download"
 
     def save_model(self, request, obj, form, change):
         if not change and not obj.created_by_id:

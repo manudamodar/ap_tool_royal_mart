@@ -37,6 +37,13 @@ class UserRole(models.TextChoices):
 
 class UserProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE)
+    account_manager = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='managed_users',
+    )
     role = models.CharField(max_length=20, choices=UserRole.choices, default=UserRole.UNASSIGNED)
     
     msal_data = models.JSONField(null=True, blank=True)
@@ -167,11 +174,20 @@ class DueReportRowBase(models.Model):
 
 
 class DueReportInvoiceWise(DueReportRowBase):
+    is_acknowledged = models.BooleanField(default=False)
+    is_payment_file_created = models.BooleanField(default=False)
+    manager_rejected = models.BooleanField(default=False)
+    manager_rejection_reason = models.TextField(null=True, blank=True)
+    manager_rejected_at = models.DateTimeField(null=True, blank=True)
+    manager_rejected_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='manager_rejected_invoice_rows')
+
     class Meta:
         verbose_name = 'Due Report Invoice Wise'
         verbose_name_plural = 'Due Report Invoice Wise'
+        constraints = [
+            models.UniqueConstraint(fields=['invoice_no', 'gst_number'], name='unique_invoice_gst_number')
+        ]
         indexes = [
-            models.Index(fields=['invoice_no', 'gst_number']),
             models.Index(fields=['due_report', 'invoice_no', 'gst_number']),
         ]
         ordering = ('-created_at',)
@@ -442,15 +458,25 @@ class DocumentResult(models.Model):
         return f"Doc {self.id} from Batch {self.batch.batch_id} - {self.reconciliation_status}"
 
 
+class PaymentType(models.TextChoices):
+    ICICI = 'ICICI', 'ICICI'
+    SBI = 'SBI', 'SBI'
+
+
 class PaymentFile(models.Model):
     id = models.CharField(max_length=50, primary_key=True, default=generate_batch_id, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     due_report = models.ForeignKey('DueReportUpload', on_delete=models.SET_NULL, null=True, blank=True)
+    payment_type = models.CharField(max_length=20, choices=PaymentType.choices, default=PaymentType.ICICI)
+    file = models.FileField(upload_to='payment_files/%Y/%m/%d/', blank=True, null=True)
+    due_report_rows = models.ManyToManyField('DueReportInvoiceWise', blank=True, related_name='payment_files')
     status = models.CharField(max_length=40, choices=BatchStatus.choices, default=BatchStatus.PENDING)
     unique_id = models.CharField(max_length=100, unique=True, null=True, blank=True)
     total_files = models.IntegerField(default=0)
     processed_files = models.IntegerField(default=0)
+    line_item_overrides = models.JSONField(default=dict, blank=True)
+    rejected_due_report_row_ids = models.JSONField(default=list, blank=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='created_payment_files')
     modified_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='modified_payment_files')
 

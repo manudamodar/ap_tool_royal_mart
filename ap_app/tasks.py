@@ -12,6 +12,7 @@ from azure.ai.formrecognizer import DocumentAnalysisClient, AnalysisFeature
 
 from .models import OCRBatch, DocumentResult, BatchStatus, ReconciliationStatus
 from .master_data_utils import get_cash_discount_details
+from .reconciliation_service import build_bill_lookup, match_bill, apply_reconciliation
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +395,8 @@ def process_ocr_batch(batch_id, folder_path):
         if not fetched_bills:
             logger.warning(f"No bills fetched from the due report for batch {batch_id}. All documents will be marked as NO_MATCH or MANUAL_REVIEW.")
 
+        bill_lookup = build_bill_lookup(fetched_bills)
+
         for root, _, files in os.walk(folder_path):
             total_in_folder = len(files)
             logger.info(f"📂 Found {total_in_folder} files to process for batch {batch_id}.")
@@ -425,68 +428,8 @@ def process_ocr_batch(batch_id, folder_path):
                     
                     # --- Reconciliation Logic ---
                     reconciliation_summary["total_processed_for_reconciliation"] += 1
-                    ocr_invoice_number = extracted_data.get("invoice_number")
-                    ocr_total_amount = extracted_data.get("total_amount")
-
-                    matched_bill = None
-                    reconciliation_details = {}
-
-                    if ocr_invoice_number:
-                        # Find a matching bill from the due report data
-                        for bill in fetched_bills:
-                            if bill.get("invoiceNo") == ocr_invoice_number:
-                                matched_bill = bill
-                                break
-                    
-                    if matched_bill:
-                        document_result.matched_bill_data = matched_bill
-                        api_payable_amount = matched_bill.get("payable")
-                        cash_discount_details = get_cash_discount_details(
-                            parsed_data=extracted_data,
-                            matched_bill_data=matched_bill,
-                        )
-                        reconciliation_details["cash_discount"] = cash_discount_details
-
-                        if ocr_total_amount is not None and api_payable_amount is not None:
-                            try:
-                                ocr_amount_decimal = Decimal(str(ocr_total_amount))
-                                api_amount_decimal = Decimal(str(api_payable_amount))
-
-                                if ocr_amount_decimal == api_amount_decimal:
-                                    document_result.reconciliation_status = ReconciliationStatus.VERIFIED
-                                    reconciliation_summary[ReconciliationStatus.VERIFIED] += 1
-                                    reconciliation_details["message"] = "Invoice number and total amount matched."
-                                else:
-                                    document_result.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
-                                    reconciliation_summary[ReconciliationStatus.MANUAL_REVIEW] += 1
-                                    reconciliation_details["message"] = "Invoice number matched, but total amount differs."
-                                    reconciliation_details["ocr_amount"] = str(ocr_total_amount)
-                                    reconciliation_details["api_amount"] = str(api_payable_amount)
-                                    logger.warning(f"File {file_name}: {reconciliation_details['message']} (OCR: {ocr_total_amount}, Due Report: {api_payable_amount})")
-                            except InvalidOperation:
-                                document_result.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
-                                reconciliation_summary[ReconciliationStatus.MANUAL_REVIEW] += 1
-                                reconciliation_details["message"] = "Invoice number matched, but OCR amount could not be parsed for comparison."
-                                reconciliation_details["ocr_amount"] = str(ocr_total_amount)
-                                reconciliation_details["api_amount"] = str(api_payable_amount)
-                                logger.warning(f"File {file_name}: {reconciliation_details['message']}")
-                        else:
-                            document_result.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
-                            reconciliation_summary[ReconciliationStatus.MANUAL_REVIEW] += 1
-                            reconciliation_details["message"] = "Invoice number matched, but OCR or due report total amount was missing for comparison."
-                            reconciliation_details["ocr_amount"] = str(ocr_total_amount)
-                            reconciliation_details["api_amount"] = str(api_payable_amount)
-                            logger.warning(f"File {file_name}: {reconciliation_details['message']}")
-                    else:
-                        document_result.reconciliation_status = ReconciliationStatus.NO_MATCH
-                        reconciliation_summary[ReconciliationStatus.NO_MATCH] += 1
-                        reconciliation_details["message"] = "No matching bill found in due report data for OCR invoice number."
-                        reconciliation_details["ocr_invoice_number"] = ocr_invoice_number
-                        reconciliation_details["ocr_total_amount"] = str(ocr_total_amount) if ocr_total_amount is not None else None
-                        logger.warning(f"File {file_name}: {reconciliation_details['message']} (OCR Invoice: {ocr_invoice_number})")
-                        
-                    document_result.reconciliation_details = reconciliation_details
-                    document_result.save() # Save reconciliation results
+                    matched_bill = match_bill(extracted_data, bill_lookup)
+                    apply_reconciliation(document_result, extracted_data, matched_bill)
                     # --- End Reconciliation Logic ---
 
                     # 2. Cleanup: delete the file from the VM disk
@@ -506,13 +449,14 @@ def process_ocr_batch(batch_id, folder_path):
                 except Exception as file_e:
                     logger.error(f"❌ Error processing file {file_name} in batch {batch_id}: {file_e}")
                     reconciliation_summary["errors_during_reconciliation"] += 1
-                    # If document_result was created, mark it as manual review due to processing error
                     if document_result:
                         document_result.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
                         document_result.reconciliation_details = {"error": str(file_e), "message": "Error during OCR or initial processing."}
                         document_result.save()
-                    # Re-raise to fail the entire batch if any file fails
-                    raise 
+                    # Continue processing remaining files instead of failing the whole batch
+                    batch.processed_files += 1
+                    batch.save()
+                    continue
 
         # Determine final batch status based on reconciliation results
         if reconciliation_summary[ReconciliationStatus.MANUAL_REVIEW] > 0 or \

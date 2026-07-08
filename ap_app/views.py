@@ -11,10 +11,13 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from django.conf import settings
 from django.shortcuts import redirect
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
+from django.urls import reverse
 from django.contrib.auth import login, logout
 from django.contrib.auth.models import User
 from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.core.files.storage import FileSystemStorage
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
@@ -28,9 +31,13 @@ from .models import (
     DueReportUpload,
     DueReportInvoiceWise,
     DueReportUnknown,
+    PaymentFile,
 )
-from .tasks import process_ocr_batch, call_getbills_api
+from .tasks import process_ocr_batch
+from .due_report_service import parse_due_report, extract_gst_from_supplier_name
 from .master_data_utils import get_cash_discount_details
+from .payment_file_service import create_payment_file_record, build_payment_file_rows, generate_payment_file_xlsx
+from .reconciliation_service import build_bill_lookup, match_bill, apply_reconciliation
 
 logger = logging.getLogger(__name__)
 
@@ -276,32 +283,35 @@ def _extract_gst_from_supplier_name(supplier_name):
     return cleaned_supplier_name, gst_number
 
 
-def _parse_due_report_storage_rows(file_obj):
-    df = pd.read_excel(file_obj)
-    df = df.dropna(how="all")
-
-    rows = []
-    for _, row in df.iterrows():
-        stored_row = {field: None for field in DUE_REPORT_STORAGE_FIELDS}
-        for column, value in row.items():
-            target_key = DUE_REPORT_STORAGE_COLUMN_ALIASES.get(_normalize_header_name(column))
-            if not target_key:
-                continue
-            stored_row[target_key] = _excel_value_to_text(value)
-
-        if any(value not in (None, "") for value in stored_row.values()):
-            rows.append(stored_row)
-
-    return rows
-
-
 def _persist_due_report_rows(due_report, rows, uploaded_by):
     invoice_wise_rows = []
     unknown_rows = []
+    update_candidates = []
+    invoice_keys = []
 
     for row in rows:
         original_supplier_name = row.get("supplier_name")
-        cleaned_supplier_name, gst_number = _extract_gst_from_supplier_name(original_supplier_name)
+        cleaned_supplier_name, gst_number = extract_gst_from_supplier_name(original_supplier_name)
+        invoice_no = (row.get("invoice_no") or "").strip()
+
+        if invoice_no and gst_number:
+            invoice_keys.append((invoice_no, gst_number))
+
+    existing_rows = []
+    if invoice_keys:
+        invoice_nos = [invoice_no for invoice_no, _ in invoice_keys]
+        gst_numbers = [gst_number for _, gst_number in invoice_keys]
+        existing_rows = DueReportInvoiceWise.objects.filter(
+            invoice_no__in=invoice_nos,
+            gst_number__in=gst_numbers,
+        )
+
+    existing_map = {(row.invoice_no, row.gst_number): row for row in existing_rows}
+
+    invoice_wise_count = 0
+    for row in rows:
+        original_supplier_name = row.get("supplier_name")
+        cleaned_supplier_name, gst_number = extract_gst_from_supplier_name(original_supplier_name)
         invoice_no = (row.get("invoice_no") or "").strip()
 
         row_data = row.copy()
@@ -317,7 +327,16 @@ def _persist_due_report_rows(due_report, rows, uploaded_by):
         }
 
         if invoice_no and gst_number:
-            invoice_wise_rows.append(DueReportInvoiceWise(**base_data))
+            key = (invoice_no, gst_number)
+            existing_row = existing_map.get(key)
+            if existing_row:
+                for field_name, value in base_data.items():
+                    setattr(existing_row, field_name, value)
+                if existing_row not in update_candidates:
+                    update_candidates.append(existing_row)
+            else:
+                invoice_wise_rows.append(DueReportInvoiceWise(**base_data))
+            invoice_wise_count += 1
         else:
             unknown_rows.append(DueReportUnknown(
                 **base_data,
@@ -326,10 +345,22 @@ def _persist_due_report_rows(due_report, rows, uploaded_by):
 
     if invoice_wise_rows:
         DueReportInvoiceWise.objects.bulk_create(invoice_wise_rows)
+    if update_candidates:
+        DueReportInvoiceWise.objects.bulk_update(
+            update_candidates,
+            fields=[
+                'due_report', 'uploaded_by', 'status', 'is_from_excel', 'is_from_api',
+                'location_name', 'supplier_name', 'gst_number', 'invoice_no', 'ref_no',
+                'bill_voucher_date', 'invoice_date', 'bill_amount', 'disc_amount',
+                'amount_adjusted', 'balance_amount', 'pending_adj_amt', 'net_balance',
+                'no_of_days', 'due_date', 'over_due_days', 'prior_date', 'group_name',
+                'voucher_type', 'msme_type',
+            ],
+        )
     if unknown_rows:
         DueReportUnknown.objects.bulk_create(unknown_rows)
 
-    return len(invoice_wise_rows), len(unknown_rows)
+    return invoice_wise_count, len(unknown_rows)
 
 
 def _parse_due_report_excel(file_obj):
@@ -481,11 +512,19 @@ def get_user_info(request):
             role = profile.role
             msal_data = profile.msal_data
             photo = profile.profile_photo
+            account_manager = profile.account_manager
         except UserProfile.DoesNotExist:
             role = UserRole.UNASSIGNED
             msal_data = {}
             photo = None
+            account_manager = None
             
+        account_manager_data = {
+            'id': account_manager.id,
+            'username': account_manager.username,
+            'email': account_manager.email,
+        } if account_manager else None
+
         full_name = f"{request.user.first_name} {request.user.last_name}".strip()
         if not full_name:
             full_name = request.user.username
@@ -499,6 +538,7 @@ def get_user_info(request):
             "full_name": full_name,
             "msal_data": msal_data,
             "photo": photo,
+            "account_manager": account_manager_data,
         })
     else:
         return JsonResponse({"authenticated": False})
@@ -557,9 +597,7 @@ def upload_due_report(request):
         return JsonResponse({"error": "Please upload an Excel due report file (.xlsx)."}, status=400)
 
     try:
-        rows = _parse_due_report_excel(report_file)
-        report_file.seek(0)
-        storage_rows = _parse_due_report_storage_rows(report_file)
+        rows, storage_rows = parse_due_report(report_file)
     except Exception as e:
         logger.error(f"Failed to parse due report {filename}: {e}")
         return JsonResponse({"error": f"Unable to parse due report: {e}"}, status=400)
@@ -976,10 +1014,44 @@ def get_bills(request):
                 "data": []
             })
 
-        fin_year = request.GET.get('finYear')
-        bills = due_report.data or []
-        if fin_year:
-            bills = [bill for bill in bills if str(bill.get("tranYear")) == str(fin_year)]
+        invoice_rows = DueReportInvoiceWise.objects.filter(due_report=due_report).order_by('created_at')
+        if invoice_rows.exists():
+            bills = []
+            for row in invoice_rows:
+                bills.append({
+                    'id': row.id,
+                    'location_name': row.location_name,
+                    'supplier_name': row.supplier_name,
+                    'gst_number': row.gst_number,
+                    'invoice_no': row.invoice_no,
+                    'ref_no': row.ref_no,
+                    'bill_voucher_date': row.bill_voucher_date,
+                    'invoice_date': row.invoice_date,
+                    'bill_amount': row.bill_amount,
+                    'disc_amount': row.disc_amount,
+                    'amount_adjusted': row.amount_adjusted,
+                    'balance_amount': row.balance_amount,
+                    'pending_adj_amt': row.pending_adj_amt,
+                    'net_balance': row.net_balance,
+                    'no_of_days': row.no_of_days,
+                    'due_date': row.due_date,
+                    'over_due_days': row.over_due_days,
+                    'prior_date': row.prior_date,
+                    'group_name': row.group_name,
+                    'voucher_type': row.voucher_type,
+                    'msme_type': row.msme_type,
+                    'status': row.status,
+                    'is_payment_file_created': row.is_payment_file_created,
+                    'manager_rejected': row.manager_rejected,
+                    'manager_rejected_at': row.manager_rejected_at,
+                    'manager_rejected_by': row.manager_rejected_by.username if row.manager_rejected_by else None,
+                    'manager_rejection_reason': row.manager_rejection_reason,
+                })
+        else:
+            fin_year = request.GET.get('finYear')
+            bills = due_report.data or []
+            if fin_year:
+                bills = [bill for bill in bills if str(bill.get("tranYear")) == str(fin_year)]
 
         return JsonResponse({
             "status": "success",
@@ -993,13 +1065,339 @@ def get_bills(request):
         })
     return JsonResponse({"error": "Method not allowed"}, status=405)
 
+
+def _get_payment_file_status(payment_file):
+    if payment_file.rejected_due_report_row_ids:
+        return 'REJECTED'
+    if payment_file.status in [BatchStatus.COMPLETED, BatchStatus.PROCESSING]:
+        return 'APPROVED'
+    return 'PENDING'
+
+
+def _serialize_payment_file(payment_file, request):
+    invoice_rows = list(payment_file.due_report_rows.order_by('id'))
+    row_data = build_payment_file_rows(payment_file.payment_type, invoice_rows, overrides=payment_file.line_item_overrides or {})
+
+    for idx, row in enumerate(invoice_rows):
+        row_data[idx].update({
+            'manager_rejected': row.manager_rejected,
+            'manager_rejected_at': row.manager_rejected_at,
+            'manager_rejected_by': row.manager_rejected_by.username if row.manager_rejected_by else None,
+            'manager_rejection_reason': row.manager_rejection_reason,
+        })
+
+    return {
+        "id": payment_file.id,
+        "unique_id": payment_file.unique_id,
+        "status": payment_file.status,
+        "payment_status": _get_payment_file_status(payment_file),
+        "payment_type": payment_file.payment_type,
+        "total_files": payment_file.total_files,
+        "processed_files": payment_file.processed_files,
+        "download_url": request.build_absolute_uri(reverse('download_payment_file', args=[payment_file.id])),
+        "file_name": f"{payment_file.id}_{payment_file.payment_type}.xlsx",
+        "due_report_id": payment_file.due_report.id if payment_file.due_report else None,
+        "due_report_filename": payment_file.due_report.original_filename if payment_file.due_report else None,
+        "created_at": payment_file.created_at,
+        "created_by": payment_file.created_by.username if payment_file.created_by else None,
+        "created_by_id": payment_file.created_by.id if payment_file.created_by else None,
+        "created_by_email": payment_file.created_by.email if payment_file.created_by else None,
+        "line_item_overrides": payment_file.line_item_overrides or {},
+        "rejected_due_report_row_ids": payment_file.rejected_due_report_row_ids or [],
+        "rows": row_data,
+    }
+
+
+def _require_manager_role(request):
+    if request.user.is_staff:
+        return True
+    try:
+        profile = UserProfile.objects.get(user=request.user)
+        return profile.role == UserRole.STORE_MANAGER
+    except UserProfile.DoesNotExist:
+        return False
+
+
+def _is_manager_of(manager_user, target_user):
+    if manager_user == target_user:
+        return False
+    if not manager_user.is_authenticated:
+        return False
+    try:
+        manager_profile = UserProfile.objects.get(user=manager_user)
+    except UserProfile.DoesNotExist:
+        return False
+    if manager_profile.role != UserRole.STORE_MANAGER:
+        return False
+    try:
+        target_profile = UserProfile.objects.get(user=target_user)
+    except UserProfile.DoesNotExist:
+        return False
+    return target_profile.account_manager_id == manager_user.id
+
+
+@csrf_exempt
+def payment_file_detail(request, payment_file_id):
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    try:
+        payment_file = PaymentFile.objects.get(pk=payment_file_id)
+    except PaymentFile.DoesNotExist:
+        return JsonResponse({"error": "Payment file not found."}, status=404)
+
+    if request.method != 'GET':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    if not request.user.is_staff and payment_file.created_by != request.user and not _is_manager_of(request.user, payment_file.created_by):
+        return JsonResponse({"error": "Forbidden"}, status=403)
+
+    return JsonResponse({"payment_file": _serialize_payment_file(payment_file, request)})
+
+
+@csrf_exempt
+def review_payment_file(request, payment_file_id):
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    if request.method != 'POST':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    if not _require_manager_role(request):
+        return JsonResponse({"error": "Forbidden"}, status=403)
+
+    try:
+        payment_file = PaymentFile.objects.get(pk=payment_file_id)
+    except PaymentFile.DoesNotExist:
+        return JsonResponse({"error": "Payment file not found."}, status=404)
+
+    if not request.user.is_staff and payment_file.created_by != request.user and not _is_manager_of(request.user, payment_file.created_by):
+        return JsonResponse({"error": "Forbidden"}, status=403)
+
+    try:
+        payload = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    edits = payload.get('edits', {})
+    rejected_ids = payload.get('rejected_ids', [])
+    if not isinstance(edits, dict) or not isinstance(rejected_ids, list):
+        return JsonResponse({"error": "Invalid payload format."}, status=400)
+
+    allowed_fields = {
+        'invoice_no', 'gst_number', 'supplier_name', 'beneficiary_name',
+        'bank_name', 'account_number', 'ifsc_code', 'branch_name', 'amount', 'remarks'
+    }
+
+    overrides = payment_file.line_item_overrides or {}
+    invoice_row_ids = {row.id for row in payment_file.due_report_rows.all()}
+
+    for row_id, update_data in edits.items():
+        try:
+            row_id_int = int(row_id)
+        except (ValueError, TypeError):
+            continue
+        if row_id_int not in invoice_row_ids:
+            continue
+        if not isinstance(update_data, dict):
+            continue
+
+        filtered = {k: v for k, v in update_data.items() if k in allowed_fields}
+        if not filtered:
+            continue
+        overrides[str(row_id_int)] = {**overrides.get(str(row_id_int), {}), **filtered}
+
+    rejected_ids = [int(row_id) for row_id in rejected_ids if str(row_id).isdigit()]
+    valid_rejected_ids = [row_id for row_id in rejected_ids if row_id in invoice_row_ids]
+
+    if valid_rejected_ids:
+        rows_to_update = DueReportInvoiceWise.objects.filter(id__in=valid_rejected_ids)
+        now = timezone.now()
+        for row in rows_to_update:
+            row.manager_rejected = True
+            row.manager_rejected_at = now
+            row.manager_rejected_by = request.user
+            row.manager_rejection_reason = payload.get('rejection_reason') or row.manager_rejection_reason
+            row.save()
+
+    payment_file.line_item_overrides = overrides
+    payment_file.rejected_due_report_row_ids = sorted(set(list(payment_file.rejected_due_report_row_ids or []) + valid_rejected_ids))
+    payment_file.modified_by = request.user
+    payment_file.save()
+
+    return JsonResponse({"payment_file": _serialize_payment_file(payment_file, request)})
+
+
+@csrf_exempt
+def regenerate_payment_file(request, payment_file_id):
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    if request.method != 'POST':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    if not UserProfile.objects.filter(user=request.user, role=UserRole.STORE_ACCOUNTANT).exists():
+        return JsonResponse({"error": "Only accountants can regenerate payment files."}, status=403)
+
+    try:
+        payment_file = PaymentFile.objects.get(pk=payment_file_id)
+    except PaymentFile.DoesNotExist:
+        return JsonResponse({"error": "Payment file not found."}, status=404)
+
+    try:
+        payload = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    invoice_ids = payload.get('invoice_ids')
+    if invoice_ids is not None and not isinstance(invoice_ids, list):
+        return JsonResponse({"error": "invoice_ids must be a list if provided."}, status=400)
+
+    if invoice_ids is None:
+        invoice_rows = list(payment_file.due_report_rows.filter(manager_rejected=False))
+    else:
+        invoice_rows = list(DueReportInvoiceWise.objects.filter(
+            id__in=invoice_ids,
+            due_report=payment_file.due_report,
+            manager_rejected=False
+        ))
+
+    if not invoice_rows:
+        return JsonResponse({"error": "No valid invoice rows available for regeneration."}, status=400)
+
+    source_overrides = payment_file.line_item_overrides or {}
+    overrides_for_new_file = {
+        key: value for key, value in source_overrides.items() if int(key) in [row.id for row in invoice_rows]
+    }
+
+    new_payment_file = create_payment_file_record(
+        payment_type=payment_file.payment_type,
+        invoice_rows=invoice_rows,
+        due_report=payment_file.due_report,
+        created_by=payment_file.created_by or request.user,
+        line_item_overrides=overrides_for_new_file,
+        rejected_due_report_row_ids=payment_file.rejected_due_report_row_ids or [],
+    )
+
+    return JsonResponse({
+        "message": "New payment file generated successfully.",
+        "payment_file": _serialize_payment_file(new_payment_file, request)
+    }, status=201)
+
+
 @csrf_exempt
 def central_payment(request):
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
     if request.method == 'POST':
-        data = {
-            "docNo": "HO-PY7",
-            "hoVoucherNo": "1",
-            "message": "Success"
-        }
-        return JsonResponse(data)
+        try:
+            payload = json.loads(request.body)
+        except json.JSONDecodeError:
+            return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+        invoice_ids = payload.get('invoice_ids')
+        payment_type = payload.get('payment_type', 'ICICI')
+
+        if not invoice_ids or not isinstance(invoice_ids, list):
+            return JsonResponse({"error": "invoice_ids must be provided as a list."}, status=400)
+
+        if payment_type not in ["ICICI", "SBI"]:
+            return JsonResponse({"error": "payment_type must be either 'ICICI' or 'SBI'."}, status=400)
+
+        invoice_rows = list(DueReportInvoiceWise.objects.filter(id__in=invoice_ids))
+        if not invoice_rows:
+            return JsonResponse({"error": "No due report invoice rows found for the provided IDs."}, status=404)
+
+        if any(row.manager_rejected for row in invoice_rows):
+            return JsonResponse({"error": "One or more selected invoice rows have been rejected by the manager and cannot be included."}, status=400)
+
+        due_report = invoice_rows[0].due_report
+        if any(row.due_report_id != due_report.id for row in invoice_rows):
+            return JsonResponse({"error": "All selected invoice rows must belong to the same due report."}, status=400)
+
+        payment_file = create_payment_file_record(
+            payment_type=payment_type,
+            invoice_rows=invoice_rows,
+            due_report=due_report,
+            created_by=request.user,
+        )
+
+        download_url = request.build_absolute_uri(reverse('download_payment_file', args=[payment_file.id]))
+        return JsonResponse({
+            "message": "Payment file created successfully.",
+            "payment_file": {
+                "id": payment_file.id,
+                "unique_id": payment_file.unique_id,
+                "status": payment_file.status,
+                "payment_status": _get_payment_file_status(payment_file),
+                "payment_type": payment_file.payment_type,
+                "total_files": payment_file.total_files,
+                "processed_files": payment_file.processed_files,
+                "download_url": download_url,
+                "file_name": f"{payment_file.id}_{payment_file.payment_type}.xlsx",
+                "file_url": None,
+                "due_report_id": due_report.id,
+                "due_report_filename": due_report.original_filename,
+            }
+        }, status=201)
+
+    if request.method == 'GET':
+        if request.user.is_staff:
+            payment_files = PaymentFile.objects.order_by('-created_at')
+        else:
+            payment_files = PaymentFile.objects.filter(
+                Q(created_by=request.user) |
+                Q(created_by__userprofile__account_manager=request.user)
+            ).order_by('-created_at')
+        return JsonResponse({
+            "payment_files": [
+                {
+                    "id": payment_file.id,
+                    "unique_id": payment_file.unique_id,
+                    "status": payment_file.status,
+                    "payment_status": _get_payment_file_status(payment_file),
+                    "payment_type": payment_file.payment_type,
+                    "total_files": payment_file.total_files,
+                    "processed_files": payment_file.processed_files,
+                    "download_url": request.build_absolute_uri(reverse('download_payment_file', args=[payment_file.id])),
+                    "file_name": f"{payment_file.id}_{payment_file.payment_type}.xlsx",
+                    "file_url": None,
+                    "due_report_id": payment_file.due_report.id if payment_file.due_report else None,
+                    "due_report_filename": payment_file.due_report.original_filename if payment_file.due_report else None,
+                    "created_at": payment_file.created_at,
+                    "created_by": payment_file.created_by.username if payment_file.created_by else None,
+                    "created_by_id": payment_file.created_by.id if payment_file.created_by else None,
+                    "created_by_email": payment_file.created_by.email if payment_file.created_by else None,
+                }
+                for payment_file in payment_files
+            ]
+        })
+
     return JsonResponse({"error": "Method not allowed"}, status=405)
+
+
+@csrf_exempt
+def download_payment_file(request, payment_file_id):
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    try:
+        payment_file = PaymentFile.objects.get(pk=payment_file_id)
+    except PaymentFile.DoesNotExist:
+        return JsonResponse({"error": "Payment file not found."}, status=404)
+
+    if payment_file.created_by and payment_file.created_by != request.user and not request.user.is_staff and not _is_manager_of(request.user, payment_file.created_by):
+        return JsonResponse({"error": "Unauthorized"}, status=403)
+
+    invoice_rows = list(payment_file.due_report_rows.all())
+    if not invoice_rows:
+        return JsonResponse({"error": "No invoice rows available for this payment file."}, status=404)
+
+    rows_data = build_payment_file_rows(payment_file.payment_type, invoice_rows, overrides=payment_file.line_item_overrides or {})
+    xlsx_content = generate_payment_file_xlsx(payment_file.payment_type, rows_data)
+    filename = f"{payment_file.id}_{payment_file.payment_type}.xlsx"
+
+    response = HttpResponse(xlsx_content, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response

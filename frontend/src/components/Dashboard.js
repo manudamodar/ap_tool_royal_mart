@@ -38,6 +38,26 @@ const Dashboard = ({ user }) => {
   const [selectedDocument, setSelectedDocument] = useState(null);
   const [, setIsFetchingDocument] = useState(false);
 
+  const [isPaymentFileModalOpen, setIsPaymentFileModalOpen] = useState(false);
+  const [invoiceRows, setInvoiceRows] = useState([]);
+  const [selectedInvoiceIds, setSelectedInvoiceIds] = useState([]);
+  const [paymentType, setPaymentType] = useState('ICICI');
+  const [isFetchingInvoiceRows, setIsFetchingInvoiceRows] = useState(false);
+  const [isGeneratingPaymentFile, setIsGeneratingPaymentFile] = useState(false);
+  const [paymentFileResult, setPaymentFileResult] = useState(null);
+
+  const [paymentFiles, setPaymentFiles] = useState([]);
+  const [paymentFilesStatusFilter, setPaymentFilesStatusFilter] = useState('PENDING');
+  const [paymentFilesAccountantFilter, setPaymentFilesAccountantFilter] = useState('ALL');
+  const [isPaymentFilesModalOpen, setIsPaymentFilesModalOpen] = useState(false);
+  const [isFetchingPaymentFiles, setIsFetchingPaymentFiles] = useState(false);
+  const [selectedPaymentFile, setSelectedPaymentFile] = useState(null);
+  const [isFetchingSelectedPaymentFile, setIsFetchingSelectedPaymentFile] = useState(false);
+  const [reviewEdits, setReviewEdits] = useState({});
+  const [reviewRejectedIds, setReviewRejectedIds] = useState([]);
+  const [reviewReason, setReviewReason] = useState('');
+  const [isSubmittingReview, setIsSubmittingReview] = useState(false);
+
   // State for Editing Document
   const [isEditingDoc, setIsEditingDoc] = useState(false);
   const [editDocData, setEditDocData] = useState({});
@@ -139,6 +159,40 @@ const Dashboard = ({ user }) => {
         return;
       }
       fileInputRef.current.click();
+    } else if (actionName === "Generate Payment File") {
+      if (!dueReport) {
+        showNotification("Upload the due report Excel file first.", "warning");
+        return;
+      }
+      setIsPaymentFileModalOpen(true);
+      fetchInvoiceRows();
+    } else if (actionName === "View Payment Files") {
+      setPaymentFilesStatusFilter('ALL');
+      setPaymentFilesAccountantFilter('ALL');
+      setIsPaymentFilesModalOpen(true);
+      setSelectedPaymentFile(null);
+      setReviewEdits({});
+      setReviewRejectedIds([]);
+      setReviewReason('');
+      fetchPaymentFiles();
+    } else if (actionName === "View Waiting Payment Files") {
+      setPaymentFilesStatusFilter('PENDING');
+      setPaymentFilesAccountantFilter('ALL');
+      setIsPaymentFilesModalOpen(true);
+      setSelectedPaymentFile(null);
+      setReviewEdits({});
+      setReviewRejectedIds([]);
+      setReviewReason('');
+      fetchPaymentFiles();
+    } else if (actionName === "View Approved Payment Files") {
+      setPaymentFilesStatusFilter('APPROVED');
+      setPaymentFilesAccountantFilter('ALL');
+      setIsPaymentFilesModalOpen(true);
+      setSelectedPaymentFile(null);
+      setReviewEdits({});
+      setReviewRejectedIds([]);
+      setReviewReason('');
+      fetchPaymentFiles();
     } else {
       showNotification(`Action Triggered: ${actionName}`, "info");
     }
@@ -148,6 +202,240 @@ const Dashboard = ({ user }) => {
     const file = event.target.files?.[0];
     if (!file) return;
     executeDueReportUpload(file);
+  };
+
+  const fetchInvoiceRows = async () => {
+    setIsFetchingInvoiceRows(true);
+    try {
+      const response = await fetch('/api/rest/payable/getbills');
+      const data = await response.json();
+      if (response.ok) {
+        const rows = Array.isArray(data.data) ? data.data : [];
+        // Normalize IDs to numbers and ensure boolean flags are proper booleans
+        const normalized = rows.map(r => ({
+          ...r,
+          id: typeof r.id === 'string' ? Number(r.id) : r.id,
+          is_payment_file_created: (r.is_payment_file_created === true) || (String(r.is_payment_file_created).toLowerCase() === 'true') || (r.is_payment_file_created === 1) || (r.is_payment_file_created === '1')
+        }));
+        setInvoiceRows(normalized);
+        setSelectedInvoiceIds([]);
+        setPaymentFileResult(null);
+      } else {
+        showNotification(data.error || 'Failed to load invoice rows.', 'error');
+      }
+    } catch (error) {
+      console.error('Error loading invoice rows:', error);
+      showNotification('Unable to load invoice rows.', 'error');
+    } finally {
+      setIsFetchingInvoiceRows(false);
+    }
+  };
+
+  const fetchPaymentFiles = async () => {
+    setIsFetchingPaymentFiles(true);
+    try {
+      const response = await fetch('/api/rest/central-payment');
+      const data = await response.json();
+      if (response.ok) {
+        const files = Array.isArray(data.payment_files) ? data.payment_files : [];
+        setPaymentFiles(files.map(file => ({
+          ...file,
+          created_by_id: file.created_by_id != null ? String(file.created_by_id) : null,
+          payment_status: file.payment_status || 'PENDING',
+        })));
+      } else {
+        showNotification(data.error || 'Unable to load payment files.', 'error');
+      }
+    } catch (error) {
+      console.error('Error fetching payment files:', error);
+      showNotification('Unable to load payment files.', 'error');
+    } finally {
+      setIsFetchingPaymentFiles(false);
+    }
+  };
+
+  const fetchPaymentFileDetail = async (paymentFileId) => {
+    setIsFetchingSelectedPaymentFile(true);
+    try {
+      const response = await fetch(`/api/rest/central-payment/${paymentFileId}/`);
+      const data = await response.json();
+      if (response.ok) {
+        setSelectedPaymentFile(data.payment_file || null);
+        setReviewEdits({});
+        setReviewRejectedIds([]);
+        setReviewReason('');
+      } else {
+        showNotification(data.error || 'Unable to load payment file details.', 'error');
+      }
+    } catch (error) {
+      console.error('Error fetching payment file detail:', error);
+      showNotification('Unable to load payment file details.', 'error');
+    } finally {
+      setIsFetchingSelectedPaymentFile(false);
+    }
+  };
+
+  const accountantOptions = [
+    { id: 'ALL', label: 'All accountants' },
+    ...Array.from(
+      paymentFiles.reduce((map, file) => {
+        if (file.created_by_id) {
+          map.set(file.created_by_id, file.created_by);
+        }
+        return map;
+      }, new Map())
+    ).map(([id, name]) => ({ id, label: name }))
+  ];
+
+  const filteredPaymentFiles = paymentFiles.filter((file) => {
+    const matchesStatus = paymentFilesStatusFilter === 'ALL' || file.payment_status === paymentFilesStatusFilter;
+    const matchesAccountant = paymentFilesAccountantFilter === 'ALL' || file.created_by_id === paymentFilesAccountantFilter;
+    return matchesStatus && matchesAccountant;
+  });
+
+  const closePaymentFilesModal = () => {
+    setIsPaymentFilesModalOpen(false);
+    setPaymentFiles([]);
+    setSelectedPaymentFile(null);
+    setReviewEdits({});
+    setReviewRejectedIds([]);
+    setReviewReason('');
+    setPaymentFilesStatusFilter('PENDING');
+    setPaymentFilesAccountantFilter('ALL');
+  };
+
+  const handleReviewFieldChange = (rowId, field, value) => {
+    setReviewEdits((current) => ({
+      ...current,
+      [rowId]: {
+        ...current[rowId],
+        [field]: value,
+      },
+    }));
+  };
+
+  const toggleReviewReject = (rowId) => {
+    setReviewRejectedIds((current) =>
+      current.includes(rowId) ? current.filter((id) => id !== rowId) : [...current, rowId]
+    );
+  };
+
+  const toggleInvoiceSelection = (invoiceId) => {
+    const id = typeof invoiceId === 'string' ? Number(invoiceId) : invoiceId;
+    if (!id && id !== 0) return; // ignore rows without a valid numeric id
+    setSelectedInvoiceIds((current) =>
+      current.includes(id)
+        ? current.filter((cid) => cid !== id)
+        : [...current, id]
+    );
+  };
+
+  const toggleSelectAll = () => {
+    const selectable = invoiceRows.filter((row) => !row.is_payment_file_created && row.id).map((row) => (typeof row.id === 'string' ? Number(row.id) : row.id));
+    const allSelected = selectable.length > 0 && selectable.every(id => selectedInvoiceIds.includes(id));
+    if (allSelected) {
+      setSelectedInvoiceIds([]);
+    } else {
+      setSelectedInvoiceIds(selectable);
+    }
+  };
+
+  const generatePaymentFile = async () => {
+    if (selectedInvoiceIds.length === 0) {
+      showNotification('Select at least one invoice to generate a payment file.', 'warning');
+      return;
+    }
+
+    setIsGeneratingPaymentFile(true);
+    try {
+      const response = await fetch('/api/rest/central-payment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invoice_ids: selectedInvoiceIds, payment_type: paymentType }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setPaymentFileResult(data.payment_file || null);
+        showNotification('Payment file generated successfully.', 'success');
+        setInvoiceRows((currentRows) =>
+          currentRows.map((row) =>
+            selectedInvoiceIds.includes(row.id)
+              ? { ...row, is_payment_file_created: true }
+              : row
+          )
+        );
+        setSelectedInvoiceIds([]);
+      } else {
+        showNotification(data.error || 'Payment file creation failed.', 'error');
+      }
+    } catch (error) {
+      console.error('Error generating payment file:', error);
+      showNotification('Unable to generate payment file.', 'error');
+    } finally {
+      setIsGeneratingPaymentFile(false);
+    }
+  };
+
+  const submitPaymentFileReview = async (paymentFileId, actionType) => {
+    if (!selectedPaymentFile) {
+      showNotification('Select a payment file first.', 'warning');
+      return;
+    }
+
+    if (reviewRejectedIds.length === 0 && Object.keys(reviewEdits).length === 0) {
+      showNotification('Please edit or reject at least one row before submitting.', 'warning');
+      return;
+    }
+
+    setIsSubmittingReview(true);
+    try {
+      const response = await fetch(`/api/rest/central-payment/${paymentFileId}/review/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          edits: reviewEdits,
+          rejected_ids: reviewRejectedIds,
+          rejection_reason: reviewReason,
+        }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setSelectedPaymentFile(data.payment_file || null);
+        showNotification('Payment file review submitted successfully.', 'success');
+        fetchPaymentFiles();
+      } else {
+        showNotification(data.error || 'Unable to submit review.', 'error');
+      }
+    } catch (error) {
+      console.error('Error submitting review:', error);
+      showNotification('Unable to submit review.', 'error');
+    } finally {
+      setIsSubmittingReview(false);
+    }
+  };
+
+  const regeneratePaymentFile = async (paymentFileId) => {
+    setIsSubmittingReview(true);
+    try {
+      const response = await fetch(`/api/rest/central-payment/${paymentFileId}/regenerate/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setSelectedPaymentFile(data.payment_file || null);
+        showNotification('Payment file regenerated successfully.', 'success');
+        fetchPaymentFiles();
+      } else {
+        showNotification(data.error || 'Unable to regenerate payment file.', 'error');
+      }
+    } catch (error) {
+      console.error('Error regenerating payment file:', error);
+      showNotification('Unable to regenerate payment file.', 'error');
+    } finally {
+      setIsSubmittingReview(false);
+    }
   };
 
   const executeDueReportUpload = async (file) => {
@@ -685,6 +973,12 @@ const Dashboard = ({ user }) => {
             />
 
             <FeatureCard
+              iconSvg={PaymentIcon}
+              title="View Payment Files"
+              description="See generated payment files and download approved outputs."
+              onClick={() => handleAction("View Payment Files")}
+            />
+            <FeatureCard
               iconSvg={ReviewIcon}
               title="Verify / Manual Review"
               description="Review flagged invoices and edit payment details."
@@ -695,7 +989,7 @@ const Dashboard = ({ user }) => {
               iconSvg={PaymentIcon}
               title="Generate Payment File"
               description="Generate final payment files for approved invoices."
-              isComingSoon={true}
+              onClick={() => handleAction("Generate Payment File")}
             />
           </div>
         );
@@ -704,17 +998,17 @@ const Dashboard = ({ user }) => {
           <div style={{ display: 'flex', gap: '2rem', justifyContent: 'center', flexWrap: 'wrap' }}>
             <FeatureCard
               iconSvg={ApproveIcon}
-              title="Approve Payment File"
-              description="Review and approve pending payment files."
-              variant="success"
-              onClick={() => handleAction("Approve Payment File")}
+              title="Payment files waiting"
+              description="View pending payment files from your accountants."
+              variant="default"
+              onClick={() => handleAction("View Waiting Payment Files")}
             />
             <FeatureCard
               iconSvg={RejectIcon}
-              title="Reject Payment File"
-              description="Reject payment files that require correction."
-              variant="danger"
-              onClick={() => handleAction("Reject Payment File")}
+              title="Approved payment files"
+              description="View payment files that have already been approved."
+              variant="success"
+              onClick={() => handleAction("View Approved Payment Files")}
             />
           </div>
         );
@@ -957,6 +1251,446 @@ const Dashboard = ({ user }) => {
           </div>
         )}
       </div>
+
+      {/* Payment File Generation Modal */}
+      {isPaymentFileModalOpen && (
+        <div style={{
+            position: 'fixed',
+            top: 0, left: 0, right: 0, bottom: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.6)',
+            display: 'flex',
+            justifyContent: 'center',
+            alignItems: 'center',
+            zIndex: 10001,
+            padding: '1rem'
+        }}>
+            <div style={{
+                width: '100%',
+                maxWidth: '1100px',
+                maxHeight: '90vh',
+                overflowY: 'auto',
+                backgroundColor: 'var(--card-background)',
+                borderRadius: '12px',
+                boxShadow: '0 16px 40px rgba(0,0,0,0.25)',
+                border: '1px solid var(--card-border)',
+                padding: '24px',
+                position: 'relative'
+            }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
+                    <div>
+                        <h2 style={{ margin: 0, color: 'var(--text-primary)' }}>Generate Payment File</h2>
+                        <p style={{ margin: '8px 0 0', color: 'var(--text-secondary)' }}>
+                          Select due-report invoices, choose a payment type, and generate a payment file with bank details lookups.
+                        </p>
+                    </div>
+                    <button
+                      onClick={() => setIsPaymentFileModalOpen(false)}
+                      style={{
+                          border: 'none',
+                          background: 'transparent',
+                          color: 'var(--text-secondary)',
+                          fontSize: '1.5rem',
+                          cursor: 'pointer'
+                      }}
+                      aria-label="Close payment file modal"
+                    >
+                      ×
+                    </button>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                        <label htmlFor="paymentTypeSelect" style={{ fontWeight: '600', color: 'var(--text-primary)' }}>Payment Type</label>
+                        <select
+                          id="paymentTypeSelect"
+                          value={paymentType}
+                          onChange={(e) => setPaymentType(e.target.value)}
+                          style={{ padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)' }}
+                        >
+                            <option value="ICICI">ICICI</option>
+                            <option value="SBI">SBI</option>
+                        </select>
+                    </div>
+                    <button
+                      onClick={toggleSelectAll}
+                      style={{
+                          border: '1px solid var(--card-border)',
+                          backgroundColor: 'var(--card-background)',
+                          color: 'var(--text-primary)',
+                          padding: '10px 16px',
+                          borderRadius: '8px',
+                          cursor: 'pointer'
+                      }}
+                    >
+                      {selectedInvoiceIds.length === invoiceRows.filter((row) => !row.is_payment_file_created).length ? 'Deselect All' : 'Select All'}
+                    </button>
+                </div>
+                <div style={{ marginTop: '1.25rem', border: '1px solid var(--card-border)', borderRadius: '12px', overflow: 'hidden' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '760px' }}>
+                        <thead style={{ backgroundColor: 'var(--background-secondary)' }}>
+                            <tr>
+                              <th style={{ padding: '12px 12px', textAlign: 'left' }}></th>
+                              <th style={{ padding: '12px 12px', textAlign: 'left' }}>ID</th>
+                              <th style={{ padding: '12px 12px', textAlign: 'left' }}>Invoice</th>
+                              <th style={{ padding: '12px 12px', textAlign: 'left' }}>GST</th>
+                              <th style={{ padding: '12px 12px', textAlign: 'left' }}>Supplier</th>
+                              <th style={{ padding: '12px 12px', textAlign: 'right' }}>Amount</th>
+                              <th style={{ padding: '12px 12px', textAlign: 'left' }}>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {isFetchingInvoiceRows ? (
+                                <tr>
+                                  <td colSpan={6} style={{ padding: '30px 12px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                                      Loading invoice rows...
+                                  </td>
+                                </tr>
+                            ) : invoiceRows.length === 0 ? (
+                                <tr>
+                                  <td colSpan={6} style={{ padding: '30px 12px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                                      No invoice rows available for payment file generation.
+                                  </td>
+                                </tr>
+                            ) : invoiceRows.map((row) => (
+                                <tr key={row.id} style={{ backgroundColor: row.is_payment_file_created ? 'rgba(82, 196, 26, 0.08)' : 'transparent' }}>
+                                    <td style={{ padding: '12px' }}>
+                                        <input
+                                          type="checkbox"
+                                          checked={selectedInvoiceIds.includes(row.id)}
+                                          disabled={row.is_payment_file_created}
+                                          onChange={() => toggleInvoiceSelection(row.id)}
+                                        />
+                                    </td>
+                                    <td style={{ padding: '12px', fontFamily: 'monospace' }}>{row.id || '—'}</td>
+                                    <td style={{ padding: '12px' }}>{row.invoice_no || '—'}</td>
+                                    <td style={{ padding: '12px' }}>{row.gst_number || '—'}</td>
+                                    <td style={{ padding: '12px' }}>{row.supplier_name || '—'}</td>
+                                    <td style={{ padding: '12px', textAlign: 'right' }}>{row.balance_amount || row.bill_amount || row.net_balance || '—'}</td>
+                                    <td style={{ padding: '12px' }}>{row.is_payment_file_created ? 'Already Created' : row.status || 'Pending'}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginTop: '1.5rem' }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', alignItems: 'center' }}>
+                        <button
+                          onClick={generatePaymentFile}
+                          disabled={isGeneratingPaymentFile || selectedInvoiceIds.length === 0}
+                          style={{
+                              border: 'none',
+                              backgroundColor: selectedInvoiceIds.length === 0 ? 'var(--background-secondary)' : 'var(--primary-accent)',
+                              color: selectedInvoiceIds.length === 0 ? 'var(--text-secondary)' : '#fff',
+                              padding: '12px 20px',
+                              borderRadius: '8px',
+                              cursor: selectedInvoiceIds.length === 0 ? 'not-allowed' : 'pointer'
+                          }}
+                        >
+                          {isGeneratingPaymentFile ? 'Generating...' : 'Generate Payment File'}
+                        </button>
+                        <span style={{ color: 'var(--text-secondary)' }}>
+                            {selectedInvoiceIds.length} invoice(s) selected.
+                        </span>
+                    </div>
+                    {paymentFileResult && (
+                        <div style={{ padding: '16px', borderRadius: '10px', backgroundColor: 'var(--background-secondary)', border: '1px solid var(--card-border)' }}>
+                            <strong style={{ display: 'block', marginBottom: '0.5rem' }}>Payment file created:</strong>
+                            <div style={{ display: 'grid', gap: '8px', fontSize: '0.95rem' }}>
+                                <span>ID: {paymentFileResult.id}</span>
+                                <span>Type: {paymentFileResult.payment_type}</span>
+                                <span>Total Rows: {paymentFileResult.total_files}</span>
+                                <span>Status: {paymentFileResult.status}</span>
+                                {paymentFileResult.download_url && (
+                                  <a href={paymentFileResult.download_url} target="_blank" rel="noreferrer" style={{ color: 'var(--primary-accent)', fontWeight: '600' }}>
+                                    Download XLSX file
+                                  </a>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+      )}
+
+      {isPaymentFilesModalOpen && (
+        <div style={{
+            position: 'fixed',
+            top: 0, left: 0, right: 0, bottom: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.65)',
+            display: 'flex',
+            justifyContent: 'center',
+            alignItems: 'center',
+            zIndex: 10002,
+            padding: '1rem'
+        }}>
+            <div style={{
+                width: '100%',
+                maxWidth: '1200px',
+                maxHeight: '92vh',
+                overflowY: 'auto',
+                backgroundColor: 'var(--card-background)',
+                borderRadius: '16px',
+                boxShadow: '0 18px 50px rgba(0,0,0,0.35)',
+                border: '1px solid var(--card-border)',
+                padding: '24px',
+                position: 'relative'
+            }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+                    <div>
+                        <h2 style={{ margin: 0, color: 'var(--text-primary)' }}>
+                          {paymentFilesStatusFilter === 'APPROVED' ? 'Approved payment files' : 'Payment files waiting'}
+                        </h2>
+                        <p style={{ margin: '8px 0 0', color: 'var(--text-secondary)' }}>
+                          {paymentFilesStatusFilter === 'APPROVED'
+                            ? 'View payment files already approved for payout.'
+                            : 'Review payment files waiting for your approval from managed accountants.'}
+                        </p>
+                    </div>
+                    <button
+                      onClick={closePaymentFilesModal}
+                      style={{
+                          border: 'none',
+                          background: 'transparent',
+                          color: 'var(--text-secondary)',
+                          fontSize: '1.75rem',
+                          cursor: 'pointer'
+                      }}
+                      aria-label="Close payment files modal"
+                    >
+                      ×
+                    </button>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.5fr', gap: '1rem', marginTop: '1.5rem' }}>
+                    <div style={{ backgroundColor: 'var(--background-secondary)', borderRadius: '12px', border: '1px solid var(--card-border)', overflow: 'hidden' }}>
+                        <div style={{ padding: '16px', borderBottom: '1px solid var(--card-border)' }}>
+                            <strong style={{ color: 'var(--text-primary)' }}>Payment File List</strong>
+                            <div style={{ marginTop: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                              <button
+                                onClick={() => setPaymentFilesStatusFilter('PENDING')}
+                                style={{
+                                  padding: '8px 14px',
+                                  borderRadius: '999px',
+                                  border: paymentFilesStatusFilter === 'PENDING' ? '1px solid var(--primary-accent)' : '1px solid var(--card-border)',
+                                  backgroundColor: paymentFilesStatusFilter === 'PENDING' ? 'var(--primary-accent)' : 'transparent',
+                                  color: paymentFilesStatusFilter === 'PENDING' ? '#fff' : 'var(--text-primary)',
+                                  cursor: 'pointer'
+                                }}
+                              >
+                                Waiting
+                              </button>
+                              <button
+                                onClick={() => setPaymentFilesStatusFilter('APPROVED')}
+                                style={{
+                                  padding: '8px 14px',
+                                  borderRadius: '999px',
+                                  border: paymentFilesStatusFilter === 'APPROVED' ? '1px solid var(--primary-accent)' : '1px solid var(--card-border)',
+                                  backgroundColor: paymentFilesStatusFilter === 'APPROVED' ? 'var(--primary-accent)' : 'transparent',
+                                  color: paymentFilesStatusFilter === 'APPROVED' ? '#fff' : 'var(--text-primary)',
+                                  cursor: 'pointer'
+                                }}
+                              >
+                                Approved
+                              </button>
+                              <select
+                                value={paymentFilesAccountantFilter}
+                                onChange={(e) => setPaymentFilesAccountantFilter(e.target.value)}
+                                style={{ padding: '8px 12px', borderRadius: '10px', border: '1px solid var(--card-border)', background: 'var(--card-background)', color: 'var(--text-primary)' }}
+                              >
+                                {accountantOptions.map((option) => (
+                                  <option key={option.id} value={option.id}>{option.label}</option>
+                                ))}
+                              </select>
+                            </div>
+                            <p style={{ margin: '8px 0 0', color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
+                                {isFetchingPaymentFiles ? 'Loading files...' : `${filteredPaymentFiles.length} file(s) match current filters`}
+                            </p>
+                        </div>
+                        <div style={{ maxHeight: '58vh', overflowY: 'auto' }}>
+                            {filteredPaymentFiles.length === 0 && !isFetchingPaymentFiles ? (
+                              <div style={{ padding: '18px', color: 'var(--text-secondary)' }}>No payment files found.</div>
+                            ) : (
+                              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                                <thead style={{ backgroundColor: 'var(--background-secondary)' }}>
+                                  <tr>
+                                    <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>ID</th>
+                                    <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Type</th>
+                                    <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Created By</th>
+                                    <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Status</th>
+                                    <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Created At</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {filteredPaymentFiles.map((paymentFile) => (
+                                    <tr
+                                      key={paymentFile.id}
+                                      onClick={() => fetchPaymentFileDetail(paymentFile.id)}
+                                      style={{
+                                        cursor: 'pointer',
+                                        backgroundColor: selectedPaymentFile?.id === paymentFile.id ? 'rgba(82, 196, 26, 0.08)' : 'transparent'
+                                      }}
+                                    >
+                                      <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>{paymentFile.id}</td>
+                                      <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>{paymentFile.payment_type}</td>
+                                      <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>{paymentFile.created_by || '—'}</td>
+                                      <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>{paymentFile.payment_status || 'PENDING'}</td>
+                                      <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>{paymentFile.created_at ? new Date(paymentFile.created_at).toLocaleString() : '—'}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            )}
+                        </div>
+                    </div>
+
+                    <div style={{ backgroundColor: 'var(--background-secondary)', borderRadius: '12px', border: '1px solid var(--card-border)', overflow: 'hidden' }}>
+                        <div style={{ padding: '16px', borderBottom: '1px solid var(--card-border)' }}>
+                            <strong style={{ color: 'var(--text-primary)' }}>Selected File</strong>
+                        </div>
+                        <div style={{ padding: '16px' }}>
+                            {isFetchingSelectedPaymentFile ? (
+                                <div style={{ color: 'var(--text-secondary)' }}>Loading selected file...</div>
+                            ) : selectedPaymentFile ? (
+                                <>
+                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginBottom: '1rem' }}>
+                                        <div>
+                                            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>ID</div>
+                                            <div style={{ fontWeight: '700', color: 'var(--text-primary)' }}>{selectedPaymentFile.id}</div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Type</div>
+                                            <div style={{ fontWeight: '700', color: 'var(--text-primary)' }}>{selectedPaymentFile.payment_type}</div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Status</div>
+                                            <div style={{ fontWeight: '700', color: 'var(--text-primary)' }}>{selectedPaymentFile.payment_status || 'PENDING'}</div>
+                                        </div>
+                                        <div>
+                                            <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Created By</div>
+                                            <div style={{ fontWeight: '700', color: 'var(--text-primary)' }}>{selectedPaymentFile.created_by || '—'}</div>
+                                        </div>
+                                    </div>
+                                    {selectedPaymentFile.download_url && (
+                                      <a href={selectedPaymentFile.download_url} target="_blank" rel="noreferrer" style={{ color: 'var(--primary-accent)', fontWeight: '600', display: 'inline-block', marginBottom: '1rem' }}>
+                                        Download current file
+                                      </a>
+                                    )}
+                                    <div style={{ maxHeight: '40vh', overflowY: 'auto', border: '1px solid var(--card-border)', borderRadius: '10px', backgroundColor: 'var(--card-background)' }}>
+                                        <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '680px' }}>
+                                            <thead style={{ backgroundColor: 'var(--background-secondary)' }}>
+                                                <tr>
+                                                  {role === 'STORE_MANAGER' ? <th style={{ padding: '12px', textAlign: 'left' }}>Reject</th> : null}
+                                                  <th style={{ padding: '12px', textAlign: 'left' }}>ID</th>
+                                                  <th style={{ padding: '12px', textAlign: 'left' }}>Invoice</th>
+                                                  <th style={{ padding: '12px', textAlign: 'left' }}>Beneficiary</th>
+                                                  <th style={{ padding: '12px', textAlign: 'left' }}>Amount</th>
+                                                  <th style={{ padding: '12px', textAlign: 'left' }}>Remarks</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {selectedPaymentFile.rows.map((row) => {
+                                                  const rowOverride = reviewEdits[row.id] || {};
+                                                  return (
+                                                  <tr key={row.id} style={{ borderBottom: '1px solid var(--card-border)' }}>
+                                                    {role === 'STORE_MANAGER' ? (
+                                                      <td style={{ padding: '10px' }}>
+                                                        <input
+                                                          type="checkbox"
+                                                          checked={reviewRejectedIds.includes(row.id)}
+                                                          onChange={() => toggleReviewReject(row.id)}
+                                                        />
+                                                      </td>
+                                                    ) : null}
+                                                    <td style={{ padding: '10px', fontFamily: 'monospace' }}>{row.id}</td>
+                                                    <td style={{ padding: '10px' }}>{row.invoice_no || '—'}</td>
+                                                    <td style={{ padding: '10px' }}>
+                                                      {role === 'STORE_MANAGER' ? (
+                                                        <input
+                                                          type="text"
+                                                          value={rowOverride.beneficiary_name ?? row.beneficiary_name ?? ''}
+                                                          onChange={(e) => handleReviewFieldChange(row.id, 'beneficiary_name', e.target.value)}
+                                                          style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)' }}
+                                                        />
+                                                      ) : (
+                                                        rowOverride.beneficiary_name ?? row.beneficiary_name ?? '—'
+                                                      )}
+                                                    </td>
+                                                    <td style={{ padding: '10px' }}>
+                                                      {role === 'STORE_MANAGER' ? (
+                                                        <input
+                                                          type="number"
+                                                          step="0.01"
+                                                          value={rowOverride.amount ?? row.amount ?? ''}
+                                                          onChange={(e) => handleReviewFieldChange(row.id, 'amount', e.target.value)}
+                                                          style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)' }}
+                                                        />
+                                                      ) : (
+                                                        rowOverride.amount ?? row.amount ?? '—'
+                                                      )}
+                                                    </td>
+                                                    <td style={{ padding: '10px' }}>
+                                                      {role === 'STORE_MANAGER' ? (
+                                                        <input
+                                                          type="text"
+                                                          value={rowOverride.remarks ?? row.remarks ?? ''}
+                                                          onChange={(e) => handleReviewFieldChange(row.id, 'remarks', e.target.value)}
+                                                          style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)' }}
+                                                        />
+                                                      ) : (
+                                                        rowOverride.remarks ?? row.remarks ?? '—'
+                                                      )}
+                                                    </td>
+                                                  </tr>
+                                                  );
+                                                })}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    {role === 'STORE_MANAGER' ? (
+                                      <>
+                                        <div style={{ marginTop: '1rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                                            <textarea
+                                              value={reviewReason}
+                                              onChange={(e) => setReviewReason(e.target.value)}
+                                              rows={3}
+                                              placeholder="Optional rejection reason or manager notes"
+                                              style={{ width: '100%', padding: '12px', borderRadius: '10px', border: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)' }}
+                                            />
+                                            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                                <button
+                                                  onClick={() => submitPaymentFileReview(selectedPaymentFile.id)}
+                                                  disabled={isSubmittingReview}
+                                                  style={{ padding: '12px 16px', borderRadius: '10px', border: 'none', backgroundColor: 'var(--primary-accent)', color: 'white', cursor: 'pointer' }}
+                                                >
+                                                    {isSubmittingReview ? 'Submitting...' : 'Submit Review'}
+                                                </button>
+                                            </div>
+                                        </div>
+                                      </>
+                                    ) : role === 'STORE_ACCOUNTANT' ? (
+                                      <div style={{ marginTop: '1rem', display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                        <button
+                                          onClick={() => regeneratePaymentFile(selectedPaymentFile.id)}
+                                          disabled={isSubmittingReview}
+                                          style={{ padding: '12px 16px', borderRadius: '10px', border: '1px solid var(--card-border)', backgroundColor: 'var(--card-background)', color: 'var(--text-primary)', cursor: 'pointer' }}
+                                        >
+                                          {isSubmittingReview ? 'Processing...' : 'Regenerate File'}
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      <div style={{ marginTop: '1rem', fontSize: '0.95rem', color: 'var(--text-secondary)' }}>
+                                        Managers can review and reject rows here. As an accountant, you can view and download your files.
+                                      </div>
+                                    )}
+                                </>
+                            ) : (
+                                <div style={{ color: 'var(--text-secondary)' }}>Select a payment file to review its rows.</div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+      )}
 
       {/* Document Details & Edit Modal */}
       {selectedDocument && (

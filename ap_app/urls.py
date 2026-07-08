@@ -23,6 +23,10 @@ urlpatterns = [
     #do not write below this line
     path('rest/payable/getbills', views.get_bills, name='get_bills'),
     path('rest/central-payment', views.central_payment, name='central_payment'),
+    path('rest/central-payment/<str:payment_file_id>/', views.payment_file_detail, name='payment_file_detail'),
+    path('rest/central-payment/<str:payment_file_id>/review/', views.review_payment_file, name='review_payment_file'),
+    path('rest/central-payment/<str:payment_file_id>/regenerate/', views.regenerate_payment_file, name='regenerate_payment_file'),
+    path('rest/central-payment/download/<str:payment_file_id>/', views.download_payment_file, name='download_payment_file'),
     # do not write below this line
 
 ]

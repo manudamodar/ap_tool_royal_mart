@@ -1,4 +1,5 @@
 import io
+import json
 from types import SimpleNamespace
 from decimal import Decimal
 from django.contrib.admin.sites import AdminSite
@@ -9,7 +10,7 @@ from django.test import SimpleTestCase, TestCase
 import pandas as pd
 
 from ap_app.admin import PaymentFileAdmin, PaymentMasterEntryAdmin
-from ap_app.models import DueReportInvoiceWise, DueReportUnknown, DueReportUpload, MasterDataFile, PaymentFile, PaymentMasterEntry
+from ap_app.models import UserProfile, DueReportInvoiceWise, DueReportUnknown, DueReportUpload, MasterDataFile, PaymentFile, PaymentMasterEntry
 from ap_app.master_data_utils import get_cash_discount_details
 from ap_app.views import _parse_due_report_excel
 
@@ -54,6 +55,22 @@ class DueReportParserTests(SimpleTestCase):
         self.assertEqual(row['dueDate'], '2026-02-12 00:00:00')
         self.assertEqual(row['invoiceDate'], '2026-02-09 00:00:00')
         self.assertEqual(row['voucherDate'], '2026-02-09 00:00:00')
+
+
+class UserProfileManagerTests(TestCase):
+    def test_account_manager_assignment_and_user_profile_reverse_relation(self):
+        manager = User.objects.create_user(username='manager', email='manager@example.com')
+        user = User.objects.create_user(username='employee', email='employee@example.com')
+        profile = UserProfile.objects.create(user=user, account_manager=manager)
+
+        self.assertEqual(profile.account_manager, manager)
+        self.assertEqual(manager.managed_users.count(), 1)
+        self.assertEqual(manager.managed_users.first(), profile)
+
+        self.client.force_login(user)
+        response = self.client.get('/api/auth/user/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json().get('account_manager', {}).get('username'), 'manager')
 
 
 class DueReportUploadStorageTests(TestCase):
@@ -125,9 +142,95 @@ class DueReportUploadStorageTests(TestCase):
         self.assertEqual(invoice_row.gst_number, '29GJPPD1953M1ZJ')
         self.assertTrue(invoice_row.is_from_excel)
         self.assertFalse(invoice_row.is_from_api)
+        self.assertFalse(invoice_row.is_acknowledged)
+        self.assertFalse(invoice_row.is_payment_file_created)
 
         self.assertTrue(DueReportUnknown.objects.filter(invoice_no='INV-002', gst_number__isnull=True).exists())
         self.assertTrue(DueReportUnknown.objects.filter(invoice_no__isnull=True, gst_number='29GJPPD1953M1ZJ').exists())
+
+    def test_upload_updates_existing_invoice_wise_row(self):
+        user = User.objects.create_user(username='due-report-duplicate-user')
+        self.client.force_login(user)
+
+        original_due_report = DueReportUpload.objects.create(
+            original_filename='existing_due_report.xlsx',
+            uploaded_by=user,
+            row_count=1,
+        )
+        existing_row = DueReportInvoiceWise.objects.create(
+            due_report=original_due_report,
+            uploaded_by=user,
+            supplier_name='OLD SUPPLIER 29GJPPD1953M1ZJ',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-001',
+            bill_amount='1000',
+        )
+
+        df = pd.DataFrame([
+            {
+                'Location Name': 'Main Branch',
+                'Supplier Name': '19 ENTERPRISES 29GJPPD1953M1ZJ',
+                'Invoice No': 'INV-001',
+                'Ref No': 'REF-001',
+                'Bill/Voucher Date': '2026-02-09',
+                'Invoice Date': '2026-02-09',
+                'Bill Amount': '1000',
+                'Disc Amount': '10',
+                'Amount Adjusted': '5',
+                'Balance Amount': '985',
+                'Pending Adj Amt': '0',
+                'Net Balance': '985',
+                'No of Days': '30',
+                'Due Date': '2026-03-11',
+                'Over Due Days': '0',
+                'Prior Date': '2026-03-10',
+                'Group Name': 'CREDITORS',
+                'Voucher Type': 'Purchase',
+                'MSMETYPE': 'NA',
+            }
+        ])
+
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Sheet1')
+        buffer.seek(0)
+
+        upload = SimpleUploadedFile(
+            'due_report.xlsx',
+            buffer.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+
+        response = self.client.post('/api/due-report/upload/', {'file': upload})
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(DueReportInvoiceWise.objects.count(), 1)
+
+        existing_row.refresh_from_db()
+        self.assertEqual(existing_row.supplier_name, '19 ENTERPRISES')
+        self.assertEqual(existing_row.gst_number, '29GJPPD1953M1ZJ')
+        self.assertEqual(existing_row.invoice_no, 'INV-001')
+        self.assertEqual(existing_row.due_report.original_filename, 'due_report.xlsx')
+        self.assertEqual(response.json()['due_report']['invoice_wise_count'], 1)
+
+    def test_due_report_invoice_wise_default_flags(self):
+        user = User.objects.create_user(username='due-report-flag-user')
+        due_report = DueReportUpload.objects.create(
+            original_filename='flag_report.xlsx',
+            uploaded_by=user,
+            row_count=1,
+        )
+
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=user,
+            supplier_name='TEST VENDOR',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-100',
+        )
+
+        self.assertFalse(invoice_row.is_acknowledged)
+        self.assertFalse(invoice_row.is_payment_file_created)
 
 
 class MasterDataFileTests(TestCase):
@@ -246,6 +349,281 @@ class PaymentFileTests(TestCase):
 
         self.assertEqual(payment_file.created_by, creator)
         self.assertEqual(payment_file.modified_by, modifier)
+
+    def test_manager_can_review_and_reject_payment_file_rows(self):
+        manager = User.objects.create_user(username='manager-user')
+        accountant = User.objects.create_user(username='accountant-user')
+        UserProfile.objects.create(user=manager, role='STORE_MANAGER')
+        UserProfile.objects.create(user=accountant, role='STORE_ACCOUNTANT', account_manager=manager)
+
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report.xlsx',
+            uploaded_by=accountant,
+            row_count=2,
+        )
+
+        invoice_row1 = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=accountant,
+            supplier_name='Test Vendor 1',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-101',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+        )
+        invoice_row2 = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=accountant,
+            supplier_name='Test Vendor 2',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-102',
+            bill_amount='2000',
+            balance_amount='2000',
+            net_balance='2000',
+        )
+
+        payment_file = PaymentFile.objects.create(
+            due_report=due_report,
+            payment_type='ICICI',
+            status='COMPLETED',
+            total_files=2,
+            processed_files=2,
+            created_by=accountant,
+            modified_by=accountant,
+        )
+        payment_file.due_report_rows.add(invoice_row1, invoice_row2)
+
+        self.client.force_login(manager)
+        response = self.client.post(
+            f'/api/rest/central-payment/{payment_file.id}/review/',
+            data=json.dumps({
+                'rejected_ids': [invoice_row2.id],
+                'edits': {
+                    str(invoice_row1.id): {
+                        'remarks': 'Approved with correction',
+                        'amount': '990.00'
+                    }
+                }
+            }),
+            content_type='application/json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payment_file.refresh_from_db()
+        invoice_row2.refresh_from_db()
+        self.assertTrue(invoice_row2.manager_rejected)
+        self.assertEqual(invoice_row2.manager_rejected_by, manager)
+        self.assertEqual(payment_file.rejected_due_report_row_ids, [invoice_row2.id])
+        self.assertEqual(payment_file.line_item_overrides.get(str(invoice_row1.id))['remarks'], 'Approved with correction')
+
+    def test_store_accountant_can_regenerate_payment_file_excluding_rejected_rows(self):
+        manager = User.objects.create_user(username='manager-user2')
+        accountant = User.objects.create_user(username='accountant-user2')
+        UserProfile.objects.create(user=manager, role='STORE_MANAGER')
+        UserProfile.objects.create(user=accountant, role='STORE_ACCOUNTANT')
+
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report2.xlsx',
+            uploaded_by=accountant,
+            row_count=2,
+        )
+
+        invoice_row1 = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=accountant,
+            supplier_name='Test Vendor 1',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-201',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+            manager_rejected=False,
+        )
+        invoice_row2 = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=accountant,
+            supplier_name='Test Vendor 2',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-202',
+            bill_amount='2000',
+            balance_amount='2000',
+            net_balance='2000',
+            manager_rejected=True,
+            manager_rejected_by=manager,
+        )
+
+        payment_file = PaymentFile.objects.create(
+            due_report=due_report,
+            payment_type='ICICI',
+            status='COMPLETED',
+            total_files=2,
+            processed_files=2,
+            created_by=accountant,
+            modified_by=accountant,
+            rejected_due_report_row_ids=[invoice_row2.id],
+        )
+        payment_file.due_report_rows.add(invoice_row1, invoice_row2)
+
+        self.client.force_login(accountant)
+        response = self.client.post(
+            f'/api/rest/central-payment/{payment_file.id}/regenerate/',
+            data=json.dumps({}),
+            content_type='application/json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertEqual(data['payment_file']['total_files'], 1)
+        self.assertEqual(len(data['payment_file']['rows']), 1)
+        self.assertTrue(any(row['id'] == invoice_row1.id for row in data['payment_file']['rows']))
+        self.assertFalse(any(row['id'] == invoice_row2.id for row in data['payment_file']['rows']))
+        self.assertEqual(data['payment_file']['rejected_due_report_row_ids'], [invoice_row2.id])
+
+    def test_store_manager_can_see_files_created_by_managed_accountant(self):
+        manager = User.objects.create_user(username='manager-user3')
+        accountant = User.objects.create_user(username='accountant-user3')
+        other_accountant = User.objects.create_user(username='other-accountant-user')
+        UserProfile.objects.create(user=manager, role='STORE_MANAGER')
+        UserProfile.objects.create(user=accountant, role='STORE_ACCOUNTANT', account_manager=manager)
+        UserProfile.objects.create(user=other_accountant, role='STORE_ACCOUNTANT')
+
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report3.xlsx',
+            uploaded_by=accountant,
+            row_count=1,
+        )
+
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=accountant,
+            supplier_name='Test Vendor 3',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-300',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+        )
+
+        managed_payment_file = PaymentFile.objects.create(
+            due_report=due_report,
+            payment_type='ICICI',
+            status='COMPLETED',
+            total_files=1,
+            processed_files=1,
+            created_by=accountant,
+            modified_by=accountant,
+        )
+        managed_payment_file.due_report_rows.add(invoice_row)
+
+        other_due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report_other.xlsx',
+            uploaded_by=other_accountant,
+            row_count=1,
+        )
+        other_invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=other_due_report,
+            uploaded_by=other_accountant,
+            supplier_name='Other Vendor',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-301',
+            bill_amount='1500',
+            balance_amount='1500',
+            net_balance='1500',
+        )
+        other_payment_file = PaymentFile.objects.create(
+            due_report=other_due_report,
+            payment_type='ICICI',
+            status='COMPLETED',
+            total_files=1,
+            processed_files=1,
+            created_by=other_accountant,
+            modified_by=other_accountant,
+        )
+        other_payment_file.due_report_rows.add(other_invoice_row)
+
+        self.client.force_login(manager)
+        response = self.client.get('/api/rest/central-payment')
+        self.assertEqual(response.status_code, 200)
+        payment_files = response.json().get('payment_files', [])
+        self.assertTrue(any(item['id'] == managed_payment_file.id for item in payment_files))
+        self.assertFalse(any(item['id'] == other_payment_file.id for item in payment_files))
+
+    def test_central_payment_creates_payment_file_for_invoice_rows(self):
+        user = User.objects.create_user(username='payment-file-user')
+        self.client.force_login(user)
+
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report.xlsx',
+            uploaded_by=user,
+            row_count=1,
+        )
+
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=user,
+            supplier_name='Test Vendor 29GJPPD1953M1ZJ',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-100',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+        )
+
+        response = self.client.post(
+            '/api/rest/central-payment',
+            data=json.dumps({
+                'invoice_ids': [invoice_row.id],
+                'payment_type': 'ICICI'
+            }),
+            content_type='application/json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertIn('payment_file', data)
+        self.assertEqual(data['payment_file']['payment_type'], 'ICICI')
+        self.assertEqual(data['payment_file']['total_files'], 1)
+        self.assertTrue(DueReportInvoiceWise.objects.filter(id=invoice_row.id, is_payment_file_created=True).exists())
+
+    def test_download_payment_file_returns_xlsx(self):
+        user = User.objects.create_user(username='payment-file-download-user')
+        self.client.force_login(user)
+
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report.xlsx',
+            uploaded_by=user,
+            row_count=1,
+        )
+
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=user,
+            supplier_name='Test Vendor 29GJPPD1953M1ZJ',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-200',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+        )
+
+        payment_file = PaymentFile.objects.create(
+            due_report=due_report,
+            payment_type='ICICI',
+            status='COMPLETED',
+            total_files=1,
+            processed_files=1,
+            created_by=user,
+            modified_by=user,
+        )
+        payment_file.due_report_rows.add(invoice_row)
+
+        response = self.client.get(f'/api/rest/central-payment/download/{payment_file.id}/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        self.assertIn('attachment; filename=', response['Content-Disposition'])
+        self.assertTrue(response.content.startswith(b'PK'))
 
 
 class CashDiscountLookupTests(TestCase):
