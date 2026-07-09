@@ -91,6 +91,7 @@ class BatchStatus(models.TextChoices):
     COMPLETED = 'INVOICES_SCANNED', 'Invoices Scanned'
     FAILED = 'FAILED', 'Failed'
     MANUAL_REVIEW = 'MANUAL_REVIEW', 'Manual Review Needed'
+    REJECTED = 'REJECTED', 'Rejected'
 
 class ReconciliationStatus(models.TextChoices):
     PENDING = 'PENDING', 'Pending Reconciliation'
@@ -477,15 +478,42 @@ class PaymentFile(models.Model):
     processed_files = models.IntegerField(default=0)
     line_item_overrides = models.JSONField(default=dict, blank=True)
     rejected_due_report_row_ids = models.JSONField(default=list, blank=True)
+    is_payment_file_approved = models.BooleanField(default=False)
+    is_payment_done = models.BooleanField(default=False)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='created_payment_files')
     modified_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='modified_payment_files')
 
     def __str__(self):
         return f"Payment File {self.id} - {self.status}"
-    
+
     def save(self, *args, **kwargs):
         if not self.unique_id:
             self.unique_id = generate_batch_id()
 
         super().save(*args, **kwargs)
+
+
+class PaymentFileInvoice(models.Model):
+    class Status(models.TextChoices):
+        PENDING_MANAGER_REVIEW = 'PENDING_MANAGER_REVIEW', 'Pending Manager Review'
+        MANAGER_APPROVED = 'MANAGER_APPROVED', 'Manager Approved'
+        MANAGER_REJECTED = 'MANAGER_REJECTED', 'Manager Rejected'
+        PAID = 'PAID', 'Paid'
+
+    payment_file = models.ForeignKey(PaymentFile, on_delete=models.CASCADE, related_name='invoice_links')
+    invoice = models.ForeignKey('DueReportInvoiceWise', on_delete=models.CASCADE, related_name='payment_file_links')
+    status = models.CharField(max_length=50, choices=Status.choices, default=Status.PENDING_MANAGER_REVIEW)
+    manager_rejection_reason = models.TextField(null=True, blank=True)
+    force_selected = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['payment_file', 'invoice'], name='unique_payment_file_invoice')
+        ]
+        ordering = ('created_at',)
+
+    def __str__(self):
+        return f"{self.payment_file_id} -> {self.invoice_id} ({self.status})"
     

@@ -32,6 +32,7 @@ from .models import (
     DueReportInvoiceWise,
     DueReportUnknown,
     PaymentFile,
+    PaymentFileInvoice,
 )
 from .tasks import process_ocr_batch
 from .due_report_service import parse_due_report, extract_gst_from_supplier_name
@@ -1067,10 +1068,12 @@ def get_bills(request):
 
 
 def _get_payment_file_status(payment_file):
+    if payment_file.is_payment_done:
+        return 'PAID'
+    if payment_file.is_payment_file_approved:
+        return 'APPROVED'
     if payment_file.rejected_due_report_row_ids:
         return 'REJECTED'
-    if payment_file.status in [BatchStatus.COMPLETED, BatchStatus.PROCESSING]:
-        return 'APPROVED'
     return 'PENDING'
 
 
@@ -1079,11 +1082,19 @@ def _serialize_payment_file(payment_file, request):
     row_data = build_payment_file_rows(payment_file.payment_type, invoice_rows, overrides=payment_file.line_item_overrides or {})
 
     for idx, row in enumerate(invoice_rows):
+        link = payment_file.invoice_links.filter(invoice=row).first()
+        review_status = link.status if link else None
+        review_reason = link.manager_rejection_reason if link else row.manager_rejection_reason
         row_data[idx].update({
             'manager_rejected': row.manager_rejected,
             'manager_rejected_at': row.manager_rejected_at,
             'manager_rejected_by': row.manager_rejected_by.username if row.manager_rejected_by else None,
             'manager_rejection_reason': row.manager_rejection_reason,
+            'review_status': review_status,
+            'review_reason': review_reason,
+            'is_rejected': review_status == PaymentFileInvoice.Status.MANAGER_REJECTED,
+            'is_approved': review_status == PaymentFileInvoice.Status.MANAGER_APPROVED,
+            'is_pending_review': review_status == PaymentFileInvoice.Status.PENDING_MANAGER_REVIEW,
         })
 
     return {
@@ -1104,6 +1115,8 @@ def _serialize_payment_file(payment_file, request):
         "created_by_email": payment_file.created_by.email if payment_file.created_by else None,
         "line_item_overrides": payment_file.line_item_overrides or {},
         "rejected_due_report_row_ids": payment_file.rejected_due_report_row_ids or [],
+        "is_payment_file_approved": payment_file.is_payment_file_approved,
+        "is_payment_done": payment_file.is_payment_done,
         "rows": row_data,
     }
 
@@ -1116,6 +1129,36 @@ def _require_manager_role(request):
         return profile.role == UserRole.STORE_MANAGER
     except UserProfile.DoesNotExist:
         return False
+
+
+def _ensure_payment_file_invoice_links(payment_file):
+    invoice_ids = set(payment_file.due_report_rows.values_list('id', flat=True))
+    existing_ids = set(payment_file.invoice_links.values_list('invoice_id', flat=True))
+    missing_ids = invoice_ids - existing_ids
+    for invoice_id in missing_ids:
+        invoice = DueReportInvoiceWise.objects.get(pk=invoice_id)
+        PaymentFileInvoice.objects.get_or_create(
+            payment_file=payment_file,
+            invoice=invoice,
+            defaults={'status': PaymentFileInvoice.Status.PENDING_MANAGER_REVIEW},
+        )
+
+
+def _is_invoice_eligible_for_new_payment_file(invoice):
+    latest_link = PaymentFileInvoice.objects.filter(invoice=invoice).order_by('-created_at').first()
+    if latest_link:
+        if latest_link.status in {
+            PaymentFileInvoice.Status.PENDING_MANAGER_REVIEW,
+            PaymentFileInvoice.Status.MANAGER_APPROVED,
+            PaymentFileInvoice.Status.PAID,
+        }:
+            return False
+        if latest_link.status == PaymentFileInvoice.Status.MANAGER_REJECTED:
+            return True
+
+    if invoice.is_payment_file_created and not invoice.manager_rejected:
+        return False
+    return True
 
 
 def _is_manager_of(manager_user, target_user):
@@ -1191,6 +1234,7 @@ def review_payment_file(request, payment_file_id):
 
     overrides = payment_file.line_item_overrides or {}
     invoice_row_ids = {row.id for row in payment_file.due_report_rows.all()}
+    _ensure_payment_file_invoice_links(payment_file)
 
     for row_id, update_data in edits.items():
         try:
@@ -1210,19 +1254,33 @@ def review_payment_file(request, payment_file_id):
     rejected_ids = [int(row_id) for row_id in rejected_ids if str(row_id).isdigit()]
     valid_rejected_ids = [row_id for row_id in rejected_ids if row_id in invoice_row_ids]
 
-    if valid_rejected_ids:
-        rows_to_update = DueReportInvoiceWise.objects.filter(id__in=valid_rejected_ids)
-        now = timezone.now()
-        for row in rows_to_update:
+    now = timezone.now()
+    for link in payment_file.invoice_links.all():
+        if link.invoice_id in valid_rejected_ids:
+            link.status = PaymentFileInvoice.Status.MANAGER_REJECTED
+            link.manager_rejection_reason = payload.get('rejection_reason') or link.manager_rejection_reason
+            link.save()
+
+            row = link.invoice
             row.manager_rejected = True
             row.manager_rejected_at = now
             row.manager_rejected_by = request.user
-            row.manager_rejection_reason = payload.get('rejection_reason') or row.manager_rejection_reason
+            row.manager_rejection_reason = link.manager_rejection_reason
             row.save()
+        else:
+            link.status = PaymentFileInvoice.Status.MANAGER_APPROVED
+            link.manager_rejection_reason = None
+            link.save()
 
     payment_file.line_item_overrides = overrides
     payment_file.rejected_due_report_row_ids = sorted(set(list(payment_file.rejected_due_report_row_ids or []) + valid_rejected_ids))
     payment_file.modified_by = request.user
+    if valid_rejected_ids:
+        payment_file.status = BatchStatus.REJECTED
+        payment_file.is_payment_file_approved = False
+    else:
+        payment_file.status = BatchStatus.COMPLETED
+        payment_file.is_payment_file_approved = True
     payment_file.save()
 
     return JsonResponse({"payment_file": _serialize_payment_file(payment_file, request)})
@@ -1259,7 +1317,6 @@ def regenerate_payment_file(request, payment_file_id):
         invoice_rows = list(DueReportInvoiceWise.objects.filter(
             id__in=invoice_ids,
             due_report=payment_file.due_report,
-            manager_rejected=False
         ))
 
     if not invoice_rows:
@@ -1278,6 +1335,10 @@ def regenerate_payment_file(request, payment_file_id):
         line_item_overrides=overrides_for_new_file,
         rejected_due_report_row_ids=payment_file.rejected_due_report_row_ids or [],
     )
+
+    payment_file.status = BatchStatus.PENDING
+    payment_file.is_payment_file_approved = False
+    payment_file.save()
 
     return JsonResponse({
         "message": "New payment file generated successfully.",
@@ -1309,18 +1370,35 @@ def central_payment(request):
         if not invoice_rows:
             return JsonResponse({"error": "No due report invoice rows found for the provided IDs."}, status=404)
 
-        if any(row.manager_rejected for row in invoice_rows):
-            return JsonResponse({"error": "One or more selected invoice rows have been rejected by the manager and cannot be included."}, status=400)
-
         due_report = invoice_rows[0].due_report
         if any(row.due_report_id != due_report.id for row in invoice_rows):
             return JsonResponse({"error": "All selected invoice rows must belong to the same due report."}, status=400)
+
+        ineligible_rows = [row for row in invoice_rows if not _is_invoice_eligible_for_new_payment_file(row)]
+        if ineligible_rows:
+            return JsonResponse({"error": "Only new invoices or invoices rejected by the manager can be selected for a new payment file."}, status=400)
+
+        force_selected_ids = payload.get('force_selected_ids', [])
+        if not isinstance(force_selected_ids, list):
+            return JsonResponse({"error": "force_selected_ids must be a list if provided."}, status=400)
+
+        force_selected_ids = [int(row_id) for row_id in force_selected_ids if str(row_id).isdigit()]
+        if not set(force_selected_ids).issubset({row.id for row in invoice_rows}):
+            return JsonResponse({"error": "force_selected_ids must reference the selected invoice rows."}, status=400)
+
+        pending_links = PaymentFileInvoice.objects.filter(
+            invoice__in=invoice_rows,
+            status=PaymentFileInvoice.Status.PENDING_MANAGER_REVIEW,
+        ).exclude(payment_file__status__in=[BatchStatus.COMPLETED, BatchStatus.REJECTED])
+        if pending_links.exists():
+            return JsonResponse({"error": "Some invoices are already pending manager review in another payment file."}, status=400)
 
         payment_file = create_payment_file_record(
             payment_type=payment_type,
             invoice_rows=invoice_rows,
             due_report=due_report,
             created_by=request.user,
+            force_selected_ids=force_selected_ids,
         )
 
         download_url = request.build_absolute_uri(reverse('download_payment_file', args=[payment_file.id]))

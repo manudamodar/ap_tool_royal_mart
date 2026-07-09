@@ -6,7 +6,7 @@ from decimal import Decimal, InvalidOperation
 import pandas as pd
 from django.core.files.base import ContentFile
 
-from .models import BatchStatus, MasterDataFile, PaymentFile, DueReportInvoiceWise
+from .models import BatchStatus, MasterDataFile, PaymentFile, PaymentFileInvoice, DueReportInvoiceWise
 
 GST_FIELDS = {
     'supplier gst number', 'suppliergstnumber', 'gst number', 'gstnumber', 'gstin', 'gst'
@@ -300,7 +300,7 @@ def generate_payment_file_xlsx(payment_type, invoice_rows):
     return output.getvalue()
 
 
-def create_payment_file_record(payment_type, invoice_rows, due_report, created_by, line_item_overrides=None, rejected_due_report_row_ids=None):
+def create_payment_file_record(payment_type, invoice_rows, due_report, created_by, line_item_overrides=None, rejected_due_report_row_ids=None, force_selected_ids=None):
     payment_file = PaymentFile.objects.create(
         due_report=due_report,
         status=BatchStatus.COMPLETED,
@@ -311,9 +311,32 @@ def create_payment_file_record(payment_type, invoice_rows, due_report, created_b
         modified_by=created_by,
         line_item_overrides=line_item_overrides or {},
         rejected_due_report_row_ids=rejected_due_report_row_ids or [],
+        is_payment_file_approved=False,
+        is_payment_done=False,
     )
 
-    payment_file.due_report_rows.set(invoice_rows)
-    DueReportInvoiceWise.objects.filter(id__in=[row.id for row in invoice_rows]).update(is_payment_file_created=True)
+    payment_file.due_report_rows.set([row.id for row in invoice_rows])
+    invoice_ids = [row.id for row in invoice_rows]
+    force_selected_ids = set(force_selected_ids or [])
+
+    for row in invoice_rows:
+        link, _ = PaymentFileInvoice.objects.get_or_create(
+            payment_file=payment_file,
+            invoice=row,
+            defaults={
+                'status': PaymentFileInvoice.Status.PENDING_MANAGER_REVIEW,
+                'force_selected': row.id in force_selected_ids,
+            },
+        )
+        if row.id in force_selected_ids:
+            link.force_selected = True
+            link.status = PaymentFileInvoice.Status.PENDING_MANAGER_REVIEW
+            link.save()
+
+    DueReportInvoiceWise.objects.filter(id__in=invoice_ids).update(
+        is_payment_file_created=True,
+        manager_rejected=False,
+
+    )
 
     return payment_file

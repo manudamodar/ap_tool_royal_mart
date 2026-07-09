@@ -6,13 +6,14 @@ from django.contrib.admin.sites import AdminSite
 from django.contrib.auth.models import User
 from django.core.files.base import ContentFile
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import SimpleTestCase, TestCase
+from django.test import RequestFactory, SimpleTestCase, TestCase
 import pandas as pd
 
 from ap_app.admin import PaymentFileAdmin, PaymentMasterEntryAdmin
-from ap_app.models import UserProfile, DueReportInvoiceWise, DueReportUnknown, DueReportUpload, MasterDataFile, PaymentFile, PaymentMasterEntry
+from ap_app.models import UserProfile, DueReportInvoiceWise, DueReportUnknown, DueReportUpload, MasterDataFile, PaymentFile, PaymentFileInvoice, PaymentMasterEntry
 from ap_app.master_data_utils import get_cash_discount_details
-from ap_app.views import _parse_due_report_excel
+from ap_app.payment_file_service import create_payment_file_record
+from ap_app.views import _parse_due_report_excel, _serialize_payment_file
 
 
 class DueReportParserTests(SimpleTestCase):
@@ -417,6 +418,36 @@ class PaymentFileTests(TestCase):
         self.assertEqual(payment_file.rejected_due_report_row_ids, [invoice_row2.id])
         self.assertEqual(payment_file.line_item_overrides.get(str(invoice_row1.id))['remarks'], 'Approved with correction')
 
+    def test_create_payment_file_record_preserves_rejected_state_for_reselected_rows(self):
+        accountant = User.objects.create_user(username='accountant-user-preserve')
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report_preserve.xlsx',
+            uploaded_by=accountant,
+            row_count=1,
+        )
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=accountant,
+            supplier_name='Preserved Vendor',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-203',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+            manager_rejected=True,
+        )
+
+        create_payment_file_record(
+            payment_type='ICICI',
+            invoice_rows=[invoice_row],
+            due_report=due_report,
+            created_by=accountant,
+        )
+
+        invoice_row.refresh_from_db()
+        self.assertTrue(invoice_row.manager_rejected)
+        self.assertTrue(invoice_row.is_payment_file_created)
+
     def test_store_accountant_can_regenerate_payment_file_excluding_rejected_rows(self):
         manager = User.objects.create_user(username='manager-user2')
         accountant = User.objects.create_user(username='accountant-user2')
@@ -549,6 +580,134 @@ class PaymentFileTests(TestCase):
         self.assertTrue(any(item['id'] == managed_payment_file.id for item in payment_files))
         self.assertFalse(any(item['id'] == other_payment_file.id for item in payment_files))
 
+    def test_payment_file_creation_sets_approval_flags_default_false(self):
+        user = User.objects.create_user(username='payment-file-approval-user')
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report_approval.xlsx',
+            uploaded_by=user,
+            row_count=1,
+        )
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=user,
+            supplier_name='Approval Vendor',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-401',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+        )
+
+        payment_file = create_payment_file_record(
+            payment_type='ICICI',
+            invoice_rows=[invoice_row],
+            due_report=due_report,
+            created_by=user,
+        )
+
+        self.assertFalse(payment_file.is_payment_file_approved)
+        self.assertFalse(payment_file.is_payment_done)
+
+    def test_payment_file_serialization_exposes_row_review_status(self):
+        user = User.objects.create_user(username='payment-file-serialization-user')
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report_serialization.xlsx',
+            uploaded_by=user,
+            row_count=1,
+        )
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=user,
+            supplier_name='Serialization Vendor',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-501',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+        )
+
+        payment_file = create_payment_file_record(
+            payment_type='ICICI',
+            invoice_rows=[invoice_row],
+            due_report=due_report,
+            created_by=user,
+        )
+        link = payment_file.invoice_links.get(invoice=invoice_row)
+        link.status = PaymentFileInvoice.Status.MANAGER_REJECTED
+        link.manager_rejection_reason = 'Invalid bank account details'
+        link.save()
+
+        request = RequestFactory().get('/')
+        payload = _serialize_payment_file(payment_file, request)
+
+        self.assertEqual(payload['rows'][0]['review_status'], PaymentFileInvoice.Status.MANAGER_REJECTED)
+        self.assertEqual(payload['rows'][0]['review_reason'], 'Invalid bank account details')
+        self.assertTrue(payload['rows'][0]['is_rejected'])
+
+    def test_central_payment_allows_new_and_rejected_rows_but_blocks_existing_unrejected_rows(self):
+        user = User.objects.create_user(username='payment-file-eligibility-user')
+        self.client.force_login(user)
+
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report_eligibility.xlsx',
+            uploaded_by=user,
+            row_count=3,
+        )
+
+        new_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=user,
+            supplier_name='New Vendor',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-402',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+        )
+        rejected_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=user,
+            supplier_name='Rejected Vendor',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-403',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+            manager_rejected=True,
+            is_payment_file_created=True,
+        )
+        existing_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=user,
+            supplier_name='Existing Vendor',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-404',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+            is_payment_file_created=True,
+        )
+
+        allow_response = self.client.post(
+            '/api/rest/central-payment',
+            data=json.dumps({
+                'invoice_ids': [new_row.id, rejected_row.id],
+                'payment_type': 'ICICI'
+            }),
+            content_type='application/json'
+        )
+        self.assertEqual(allow_response.status_code, 201)
+
+        block_response = self.client.post(
+            '/api/rest/central-payment',
+            data=json.dumps({
+                'invoice_ids': [existing_row.id],
+                'payment_type': 'ICICI'
+            }),
+            content_type='application/json'
+        )
+        self.assertEqual(block_response.status_code, 400)
+
     def test_central_payment_creates_payment_file_for_invoice_rows(self):
         user = User.objects.create_user(username='payment-file-user')
         self.client.force_login(user)
@@ -585,6 +744,54 @@ class PaymentFileTests(TestCase):
         self.assertEqual(data['payment_file']['payment_type'], 'ICICI')
         self.assertEqual(data['payment_file']['total_files'], 1)
         self.assertTrue(DueReportInvoiceWise.objects.filter(id=invoice_row.id, is_payment_file_created=True).exists())
+
+    def test_rejected_invoice_can_be_reselected_in_a_new_payment_file(self):
+        user = User.objects.create_user(username='payment-file-resubmit-user')
+        self.client.force_login(user)
+
+        due_report = DueReportUpload.objects.create(
+            original_filename='payment_due_report_resubmit.xlsx',
+            uploaded_by=user,
+            row_count=1,
+        )
+
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report,
+            uploaded_by=user,
+            supplier_name='Resubmission Vendor',
+            gst_number='29GJPPD1953M1ZJ',
+            invoice_no='INV-500',
+            bill_amount='1000',
+            balance_amount='1000',
+            net_balance='1000',
+        )
+
+        first_payment_file = create_payment_file_record(
+            payment_type='ICICI',
+            invoice_rows=[invoice_row],
+            due_report=due_report,
+            created_by=user,
+        )
+        first_link = first_payment_file.invoice_links.get(invoice=invoice_row)
+        first_link.status = PaymentFileInvoice.Status.MANAGER_REJECTED
+        first_link.manager_rejection_reason = 'Invalid bank account details'
+        first_link.save()
+
+        response = self.client.post(
+            '/api/rest/central-payment',
+            data=json.dumps({
+                'invoice_ids': [invoice_row.id],
+                'payment_type': 'ICICI',
+                'force_selected_ids': [invoice_row.id],
+            }),
+            content_type='application/json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        second_payment_file = PaymentFile.objects.order_by('-created_at').first()
+        second_link = second_payment_file.invoice_links.get(invoice=invoice_row)
+        self.assertEqual(second_link.status, PaymentFileInvoice.Status.PENDING_MANAGER_REVIEW)
+        self.assertTrue(second_link.force_selected)
 
     def test_download_payment_file_returns_xlsx(self):
         user = User.objects.create_user(username='payment-file-download-user')
