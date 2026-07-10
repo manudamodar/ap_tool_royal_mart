@@ -196,8 +196,24 @@ class DueReportRowAdmin(admin.ModelAdmin):
 
 @admin.register(DueReportInvoiceWise)
 class DueReportInvoiceWiseAdmin(DueReportRowAdmin):
-    list_display = DueReportRowAdmin.list_display + ('is_acknowledged', 'is_payment_file_created', 'manager_rejected', 'manager_rejected_by')
-    readonly_fields = DueReportRowAdmin.readonly_fields + ('is_acknowledged', 'is_payment_file_created', 'manager_rejected', 'manager_rejected_by', 'manager_rejection_reason', 'manager_rejected_at')
+    list_display = DueReportRowAdmin.list_display + (
+        'is_acknowledged',
+        'invoice_scanned',
+        'invoice_reconciliation_status',
+        'is_payment_file_created',
+        'manager_rejected',
+        'manager_rejected_by',
+    )
+    readonly_fields = DueReportRowAdmin.readonly_fields + (
+        'is_acknowledged',
+        'invoice_scanned',
+        'invoice_reconciliation_status',
+        'is_payment_file_created',
+        'manager_rejected',
+        'manager_rejected_by',
+        'manager_rejection_reason',
+        'manager_rejected_at',
+    )
 
 
 @admin.register(DueReportUnknown)

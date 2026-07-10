@@ -110,6 +110,7 @@ def generate_batch_id():
 def generate_unique_id():
     """Generates a human-readable batch ID like AP_YYYYMMDD_UUID"""
     date_str = timezone.now().strftime('%Y%m%d')
+    short_uuid = str(uuid.uuid4())[:8].upper()
     return f"AP_{date_str}_{short_uuid}"
 
 
@@ -140,6 +141,12 @@ class DueReportRowStatus(models.TextChoices):
     PENDING = 'PENDING', 'Pending'
     READY = 'READY', 'Ready'
     MANUAL_REVIEW = 'MANUAL_REVIEW', 'Manual Review'
+
+
+class DueReportInvoiceReconciliationStatus(models.TextChoices):
+    VERIFIED = 'VERIFIED', 'Verified'
+    UNVERIFIED = 'UNVERIFIED', 'Unverified'
+    MANUALLY_VERIFIED = 'MANUALLY_VERIFIED', 'Manually Verified'
 
 
 class DueReportRowBase(models.Model):
@@ -176,6 +183,12 @@ class DueReportRowBase(models.Model):
 
 class DueReportInvoiceWise(DueReportRowBase):
     is_acknowledged = models.BooleanField(default=False)
+    invoice_scanned = models.BooleanField(default=False)
+    invoice_reconciliation_status = models.CharField(
+        max_length=20,
+        choices=DueReportInvoiceReconciliationStatus.choices,
+        default=DueReportInvoiceReconciliationStatus.UNVERIFIED,
+    )
     is_payment_file_created = models.BooleanField(default=False)
     manager_rejected = models.BooleanField(default=False)
     manager_rejection_reason = models.TextField(null=True, blank=True)

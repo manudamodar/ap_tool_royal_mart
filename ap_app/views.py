@@ -39,6 +39,7 @@ from .due_report_service import parse_due_report, extract_gst_from_supplier_name
 from .master_data_utils import get_cash_discount_details
 from .payment_file_service import create_payment_file_record, build_payment_file_rows, generate_payment_file_xlsx
 from .reconciliation_service import build_bill_lookup, match_bill, apply_reconciliation
+from .reconciliation_service import sync_due_report_invoice_reconciliation
 
 logger = logging.getLogger(__name__)
 
@@ -326,17 +327,22 @@ def _persist_due_report_rows(due_report, rows, uploaded_by):
             "is_from_excel": True,
             "is_from_api": False,
         }
+        invoice_row_data = {
+            **base_data,
+            "invoice_scanned": False,
+            "invoice_reconciliation_status": 'UNVERIFIED',
+        }
 
         if invoice_no and gst_number:
             key = (invoice_no, gst_number)
             existing_row = existing_map.get(key)
             if existing_row:
-                for field_name, value in base_data.items():
+                for field_name, value in invoice_row_data.items():
                     setattr(existing_row, field_name, value)
                 if existing_row not in update_candidates:
                     update_candidates.append(existing_row)
             else:
-                invoice_wise_rows.append(DueReportInvoiceWise(**base_data))
+                invoice_wise_rows.append(DueReportInvoiceWise(**invoice_row_data))
             invoice_wise_count += 1
         else:
             unknown_rows.append(DueReportUnknown(
@@ -356,6 +362,7 @@ def _persist_due_report_rows(due_report, rows, uploaded_by):
                 'amount_adjusted', 'balance_amount', 'pending_adj_amt', 'net_balance',
                 'no_of_days', 'due_date', 'over_due_days', 'prior_date', 'group_name',
                 'voucher_type', 'msme_type',
+                'invoice_scanned', 'invoice_reconciliation_status',
             ],
         )
     if unknown_rows:
@@ -911,7 +918,7 @@ def update_document_data(request, document_id):
         document.audit_trail.append(audit_entry)
         
         # 3. Re-run reconciliation
-        fetched_bills = document.batch.due_report.data if document.batch.due_report else call_getbills_api(fin_year="2025_2026")
+        fetched_bills = document.batch.due_report.data if document.batch.due_report else []
         
         ocr_invoice_number = document.parsed_data.get("invoice_number")
         ocr_total_amount = document.parsed_data.get("total_amount")
@@ -963,6 +970,7 @@ def update_document_data(request, document_id):
             
         document.reconciliation_details = reconciliation_details
         document.save()
+        sync_due_report_invoice_reconciliation(document, matched_bill=matched_bill)
         
         # 4. Check if the parent batch status needs to be updated
         batch = document.batch
@@ -1042,6 +1050,8 @@ def get_bills(request):
                     'voucher_type': row.voucher_type,
                     'msme_type': row.msme_type,
                     'status': row.status,
+                    'invoice_scanned': row.invoice_scanned,
+                    'invoice_reconciliation_status': row.invoice_reconciliation_status,
                     'is_payment_file_created': row.is_payment_file_created,
                     'manager_rejected': row.manager_rejected,
                     'manager_rejected_at': row.manager_rejected_at,
@@ -1473,7 +1483,11 @@ def download_payment_file(request, payment_file_id):
         return JsonResponse({"error": "No invoice rows available for this payment file."}, status=404)
 
     rows_data = build_payment_file_rows(payment_file.payment_type, invoice_rows, overrides=payment_file.line_item_overrides or {})
-    xlsx_content = generate_payment_file_xlsx(payment_file.payment_type, rows_data)
+    xlsx_content = generate_payment_file_xlsx(
+        payment_file.payment_type,
+        rows_data,
+        payment_ref=payment_file.unique_id or payment_file.id,
+    )
     filename = f"{payment_file.id}_{payment_file.payment_type}.xlsx"
 
     response = HttpResponse(xlsx_content, content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')

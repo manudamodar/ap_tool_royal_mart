@@ -12,6 +12,17 @@ const DOCUMENT_DETAIL_FIELDS = [
   { key: 'invoice_number', label: 'Invoice Number' },
 ];
 
+const VERIFIED_RECO_STATUSES = ['VERIFIED', 'MANUALLY_VERIFIED'];
+
+const normalizeBooleanFlag = (value) => {
+  return (value === true) || (String(value).toLowerCase() === 'true') || (value === 1) || (value === '1');
+};
+
+const normalizeInvoiceRecoStatus = (value) => {
+  const normalized = (value || 'UNVERIFIED').toString().trim().toUpperCase();
+  return ['VERIFIED', 'UNVERIFIED', 'MANUALLY_VERIFIED'].includes(normalized) ? normalized : 'UNVERIFIED';
+};
+
 const Dashboard = ({ user }) => {
   const [role, setRole] = useState(user.role);
   const fileInputRef = useRef(null);
@@ -220,8 +231,10 @@ const Dashboard = ({ user }) => {
         const normalized = rows.map(r => ({
           ...r,
           id: typeof r.id === 'string' ? Number(r.id) : r.id,
-          is_payment_file_created: (r.is_payment_file_created === true) || (String(r.is_payment_file_created).toLowerCase() === 'true') || (r.is_payment_file_created === 1) || (r.is_payment_file_created === '1'),
-          manager_rejected: (r.manager_rejected === true) || (String(r.manager_rejected).toLowerCase() === 'true') || (r.manager_rejected === 1) || (r.manager_rejected === '1')
+          is_payment_file_created: normalizeBooleanFlag(r.is_payment_file_created),
+          manager_rejected: normalizeBooleanFlag(r.manager_rejected),
+          invoice_scanned: normalizeBooleanFlag(r.invoice_scanned),
+          invoice_reconciliation_status: normalizeInvoiceRecoStatus(r.invoice_reconciliation_status),
         }));
         setInvoiceRows(normalized);
         setSelectedInvoiceIds([]);
@@ -352,6 +365,8 @@ const Dashboard = ({ user }) => {
 
   const isInvoiceSelectableForPayment = (row) => {
     if (!row?.id) return false;
+    const isRecoEligible = VERIFIED_RECO_STATUSES.includes(normalizeInvoiceRecoStatus(row.invoice_reconciliation_status));
+    if (!row.invoice_scanned || !isRecoEligible) return false;
     return !row.is_payment_file_created || row.manager_rejected;
   };
 
@@ -395,7 +410,13 @@ const Dashboard = ({ user }) => {
         setInvoiceRows((currentRows) =>
           currentRows.map((row) =>
             selectedInvoiceIds.includes(row.id)
-              ? { ...row, is_payment_file_created: true, manager_rejected: false }
+              ? {
+                  ...row,
+                  is_payment_file_created: true,
+                  manager_rejected: false,
+                  invoice_scanned: true,
+                  invoice_reconciliation_status: row.invoice_reconciliation_status || 'VERIFIED',
+                }
               : row
           )
         );
@@ -439,30 +460,6 @@ const Dashboard = ({ user }) => {
     } catch (error) {
       console.error('Error submitting review:', error);
       showNotification('Unable to submit review.', 'error');
-    } finally {
-      setIsSubmittingReview(false);
-    }
-  };
-
-  const regeneratePaymentFile = async (paymentFileId) => {
-    setIsSubmittingReview(true);
-    try {
-      const response = await fetch(`/api/rest/central-payment/${paymentFileId}/regenerate/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      const data = await response.json();
-      if (response.ok) {
-        setSelectedPaymentFile(data.payment_file || null);
-        showNotification('Payment file regenerated successfully.', 'success');
-        fetchPaymentFiles();
-      } else {
-        showNotification(data.error || 'Unable to regenerate payment file.', 'error');
-      }
-    } catch (error) {
-      console.error('Error regenerating payment file:', error);
-      showNotification('Unable to regenerate payment file.', 'error');
     } finally {
       setIsSubmittingReview(false);
     }
@@ -742,6 +739,61 @@ const Dashboard = ({ user }) => {
       return stringValue ? stringValue : null;
   };
 
+  const recoEligibleRows = invoiceRows.filter(
+    (row) => row.invoice_scanned && VERIFIED_RECO_STATUSES.includes(normalizeInvoiceRecoStatus(row.invoice_reconciliation_status))
+  );
+  const freshInvoiceRows = recoEligibleRows.filter((row) => !row.is_payment_file_created && !row.manager_rejected);
+  const rejectedInvoiceRows = recoEligibleRows.filter((row) => row.manager_rejected);
+  const approvedGeneratedInvoiceRows = recoEligibleRows.filter((row) => row.is_payment_file_created && !row.manager_rejected);
+  const unverifiedInvoiceRows = invoiceRows.filter(
+    (row) => row.invoice_scanned && !VERIFIED_RECO_STATUSES.includes(normalizeInvoiceRecoStatus(row.invoice_reconciliation_status))
+  );
+  const unscannedInvoiceRows = invoiceRows.filter((row) => !row.invoice_scanned);
+  const selectableInvoiceCount = invoiceRows.filter((row) => isInvoiceSelectableForPayment(row)).length;
+
+  const getInvoiceRowStatusText = (row) => {
+    if (!row.invoice_scanned) return 'Unscanned';
+    if (!VERIFIED_RECO_STATUSES.includes(normalizeInvoiceRecoStatus(row.invoice_reconciliation_status))) {
+      return 'Scanned - Unverified';
+    }
+    if (row.manager_rejected) return 'Rejected - can regenerate';
+    if (row.is_payment_file_created) return 'Already Created';
+    return row.status || 'Pending';
+  };
+
+  const renderInvoiceSectionRows = (rows, emptyMessage, sectionKeyPrefix) => {
+    if (rows.length === 0) {
+      return (
+        <tr key={`${sectionKeyPrefix}-empty`}>
+          <td colSpan={7} style={{ padding: '14px 12px', color: 'var(--text-secondary)', fontStyle: 'italic' }}>
+            {emptyMessage}
+          </td>
+        </tr>
+      );
+    }
+
+    return rows.map((row) => (
+      <tr key={`${sectionKeyPrefix}-${row.id}`} style={{ backgroundColor: row.is_payment_file_created ? 'rgba(82, 196, 26, 0.08)' : 'transparent' }}>
+        <td style={{ padding: '12px' }}>
+          <input
+            type="checkbox"
+            checked={selectedInvoiceIds.includes(row.id)}
+            disabled={!isInvoiceSelectableForPayment(row)}
+            onChange={() => toggleInvoiceSelection(row.id)}
+          />
+        </td>
+        <td style={{ padding: '12px', fontFamily: 'monospace' }}>{row.id || '—'}</td>
+        <td style={{ padding: '12px' }}>{row.invoice_no || '—'}</td>
+        <td style={{ padding: '12px' }}>{row.gst_number || '—'}</td>
+        <td style={{ padding: '12px' }}>{row.supplier_name || '—'}</td>
+        <td style={{ padding: '12px', textAlign: 'right' }}>{row.balance_amount || row.bill_amount || row.net_balance || '—'}</td>
+        <td style={{ padding: '12px' }}>
+          {getInvoiceRowStatusText(row)}
+        </td>
+      </tr>
+    ));
+  };
+
 
   /* --- UI COMPONENTS --- */
 
@@ -979,6 +1031,13 @@ const Dashboard = ({ user }) => {
       return { label: 'Waiting', color: 'var(--primary-accent)' };
   };
 
+      const getPaymentFileRowAmountDisplay = (row) => {
+        const rawValue = row?.amount ?? row?.balance_amount ?? row?.bill_amount ?? row?.net_balance;
+        if (rawValue === null || rawValue === undefined || rawValue === '') return '—';
+        const numericValue = typeof rawValue === 'number' ? rawValue : parseFloat(rawValue);
+        return Number.isFinite(numericValue) ? numericValue.toFixed(2) : rawValue;
+      };
+
   const renderContent = () => {
     switch (role) {
       case 'AP_TEAM':
@@ -1033,13 +1092,7 @@ const Dashboard = ({ user }) => {
               description="See generated payment files and download approved outputs."
               onClick={() => handleAction("View Payment Files")}
             />
-            <FeatureCard
-              iconSvg={ReviewIcon}
-              title="Verify / Manual Review"
-              description="Review flagged invoices and edit payment details."
-              isComingSoon={true}
-              onClick={() => handleAction("Manual Review")}
-            />
+
             <FeatureCard
               iconSvg={PaymentIcon}
               title="Generate Payment File"
@@ -1367,16 +1420,18 @@ const Dashboard = ({ user }) => {
                     </div>
                     <button
                       onClick={toggleSelectAll}
+                      disabled={selectableInvoiceCount === 0}
                       style={{
                           border: '1px solid var(--card-border)',
                           backgroundColor: 'var(--card-background)',
                           color: 'var(--text-primary)',
                           padding: '10px 16px',
                           borderRadius: '8px',
-                          cursor: 'pointer'
+                          cursor: selectableInvoiceCount === 0 ? 'not-allowed' : 'pointer',
+                          opacity: selectableInvoiceCount === 0 ? 0.7 : 1
                       }}
                     >
-                      {selectedInvoiceIds.length === invoiceRows.filter((row) => isInvoiceSelectableForPayment(row)).length ? 'Deselect All' : 'Select All'}
+                      {selectedInvoiceIds.length === selectableInvoiceCount && selectableInvoiceCount > 0 ? 'Deselect All' : 'Select All'}
                     </button>
                 </div>
                 <div style={{ marginTop: '1.25rem', border: '1px solid var(--card-border)', borderRadius: '12px', overflow: 'hidden' }}>
@@ -1395,36 +1450,54 @@ const Dashboard = ({ user }) => {
                         <tbody>
                             {isFetchingInvoiceRows ? (
                                 <tr>
-                                  <td colSpan={6} style={{ padding: '30px 12px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                                  <td colSpan={7} style={{ padding: '30px 12px', textAlign: 'center', color: 'var(--text-secondary)' }}>
                                       Loading invoice rows...
                                   </td>
                                 </tr>
                             ) : invoiceRows.length === 0 ? (
                                 <tr>
-                                  <td colSpan={6} style={{ padding: '30px 12px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                                  <td colSpan={7} style={{ padding: '30px 12px', textAlign: 'center', color: 'var(--text-secondary)' }}>
                                       No invoice rows available for payment file generation.
                                   </td>
                                 </tr>
-                            ) : invoiceRows.map((row) => (
-                                <tr key={row.id} style={{ backgroundColor: row.is_payment_file_created ? 'rgba(82, 196, 26, 0.08)' : 'transparent' }}>
-                                    <td style={{ padding: '12px' }}>
-                                        <input
-                                          type="checkbox"
-                                          checked={selectedInvoiceIds.includes(row.id)}
-                                          disabled={!isInvoiceSelectableForPayment(row)}
-                                          onChange={() => toggleInvoiceSelection(row.id)}
-                                        />
-                                    </td>
-                                    <td style={{ padding: '12px', fontFamily: 'monospace' }}>{row.id || '—'}</td>
-                                    <td style={{ padding: '12px' }}>{row.invoice_no || '—'}</td>
-                                    <td style={{ padding: '12px' }}>{row.gst_number || '—'}</td>
-                                    <td style={{ padding: '12px' }}>{row.supplier_name || '—'}</td>
-                                    <td style={{ padding: '12px', textAlign: 'right' }}>{row.balance_amount || row.bill_amount || row.net_balance || '—'}</td>
-                                    <td style={{ padding: '12px' }}>
-                                      {row.manager_rejected ? 'Rejected - can regenerate' : (row.is_payment_file_created ? 'Already Created' : (row.status || 'Pending'))}
-                                    </td>
+                            ) : (
+                              <>
+                                <tr>
+                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#f6ffed', color: '#389e0d', fontWeight: '700' }}>
+                                    Fresh Invoices (Scanned + Verified/Manually Verified) ({freshInvoiceRows.length})
+                                  </td>
                                 </tr>
-                            ))}
+                                {renderInvoiceSectionRows(freshInvoiceRows, 'No fresh invoices.', 'fresh')}
+
+                                <tr>
+                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#fff7e6', color: '#d46b08', fontWeight: '700' }}>
+                                    Rejected Invoices ({rejectedInvoiceRows.length})
+                                  </td>
+                                </tr>
+                                {renderInvoiceSectionRows(rejectedInvoiceRows, 'No rejected invoices.', 'rejected')}
+
+                                <tr>
+                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#fff1f0', color: '#cf1322', fontWeight: '700' }}>
+                                    Unverified Invoices (Scanned but not verified) ({unverifiedInvoiceRows.length})
+                                  </td>
+                                </tr>
+                                {renderInvoiceSectionRows(unverifiedInvoiceRows, 'No unverified invoices.', 'unverified')}
+
+                                <tr>
+                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#f9f0ff', color: '#531dab', fontWeight: '700' }}>
+                                    Unscanned Invoices ({unscannedInvoiceRows.length})
+                                  </td>
+                                </tr>
+                                {renderInvoiceSectionRows(unscannedInvoiceRows, 'No unscanned invoices.', 'unscanned')}
+
+                                <tr>
+                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#f0f5ff', color: '#1d39c4', fontWeight: '700' }}>
+                                    Already Generated & Approved Invoices ({approvedGeneratedInvoiceRows.length})
+                                  </td>
+                                </tr>
+                                {renderInvoiceSectionRows(approvedGeneratedInvoiceRows, 'No already-generated approved invoices.', 'approved')}
+                              </>
+                            )}
                         </tbody>
                     </table>
                 </div>
@@ -1711,12 +1784,65 @@ const Dashboard = ({ user }) => {
                                       )}
                                     </div>
 
+                                    <div style={{ marginBottom: '1.25rem' }}>
+                                      <div style={{ fontWeight: '600', color: 'var(--text-primary)', marginBottom: '0.75rem' }}>Invoice Line Items</div>
+                                      <div style={{ border: '1px solid var(--card-border)', borderRadius: '12px', overflow: 'hidden', backgroundColor: 'var(--card-background)' }}>
+                                        <div style={{ maxHeight: '340px', overflowY: 'auto', overflowX: 'auto' }}>
+                                          <table style={{ width: '100%', minWidth: '860px', borderCollapse: 'collapse' }}>
+                                            <thead style={{ backgroundColor: 'var(--background-secondary)', position: 'sticky', top: 0, zIndex: 1 }}>
+                                              <tr>
+                                                {role === 'STORE_MANAGER' && !(selectedPaymentFile.payment_status === 'APPROVED' || selectedPaymentFile.payment_status === 'PAID' || selectedPaymentFile.is_payment_file_approved) && (
+                                                  <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Reject</th>
+                                                )}
+                                                <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Invoice</th>
+                                                <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>GST</th>
+                                                <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Supplier</th>
+                                                <th style={{ padding: '12px', textAlign: 'right', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Amount</th>
+                                                <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Review Status</th>
+                                                <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Reason</th>
+                                              </tr>
+                                            </thead>
+                                            <tbody>
+                                              {(selectedPaymentFile.rows || []).map((row, index) => {
+                                                const reviewMeta = getPaymentRowReviewMeta(row);
+                                                const isChecked = reviewRejectedIds.includes(row.id);
+                                                const isPaymentFileLocked = selectedPaymentFile.payment_status === 'APPROVED' || selectedPaymentFile.payment_status === 'PAID' || selectedPaymentFile.is_payment_file_approved;
+                                                return (
+                                                  <tr key={row.id || `${row.invoice_no}-${index}`} style={{ borderBottom: '1px solid var(--card-border)', backgroundColor: isChecked ? 'rgba(255, 77, 79, 0.08)' : (index % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.02)') }}>
+                                                    {role === 'STORE_MANAGER' && !isPaymentFileLocked && (
+                                                      <td style={{ padding: '12px' }}>
+                                                        <input
+                                                          type="checkbox"
+                                                          checked={isChecked}
+                                                          onChange={() => toggleReviewReject(row.id)}
+                                                        />
+                                                      </td>
+                                                    )}
+                                                    <td style={{ padding: '12px' }}>{row.invoice_no || '—'}</td>
+                                                    <td style={{ padding: '12px' }}>{row.gst_number || '—'}</td>
+                                                    <td style={{ padding: '12px' }}>{row.supplier_name || '—'}</td>
+                                                    <td style={{ padding: '12px', textAlign: 'right', fontFamily: 'monospace' }}>{getPaymentFileRowAmountDisplay(row)}</td>
+                                                    <td style={{ padding: '12px' }}>
+                                                      <span style={{ color: isChecked ? 'var(--danger)' : reviewMeta.color, fontWeight: '700' }}>
+                                                        {isChecked ? 'Marked Rejected' : reviewMeta.label}
+                                                      </span>
+                                                    </td>
+                                                    <td style={{ padding: '12px', color: 'var(--text-secondary)' }}>{row.review_reason || row.manager_rejection_reason || '—'}</td>
+                                                  </tr>
+                                                );
+                                              })}
+                                            </tbody>
+                                          </table>
+                                        </div>
+                                      </div>
+                                    </div>
+
                                     {/* Manager review */}
-                                    {role === 'STORE_MANAGER' && (
+                                    {role === 'STORE_MANAGER' && !(selectedPaymentFile.payment_status === 'APPROVED' || selectedPaymentFile.payment_status === 'PAID' || selectedPaymentFile.is_payment_file_approved) && (
                                       <div style={{ borderTop: '1px solid var(--card-border)', paddingTop: '1rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                                         <div style={{ fontWeight: '600', color: 'var(--text-primary)' }}>Manager Review</div>
                                         <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
-                                          Open the file view above to inspect rows. Tick the checkboxes in the review table to reject individual rows, then submit below.
+                                          Reject invoice rows line-item wise using the checkboxes above, then submit the review.
                                         </div>
                                         <textarea
                                           value={reviewReason}
@@ -1734,19 +1860,6 @@ const Dashboard = ({ user }) => {
                                             {isSubmittingReview ? 'Submitting...' : 'Submit Review'}
                                           </button>
                                         </div>
-                                      </div>
-                                    )}
-
-                                    {/* Accountant regenerate */}
-                                    {role === 'STORE_ACCOUNTANT' && (
-                                      <div style={{ borderTop: '1px solid var(--card-border)', paddingTop: '1rem' }}>
-                                        <button
-                                          onClick={() => regeneratePaymentFile(selectedPaymentFile.id)}
-                                          disabled={isSubmittingReview}
-                                          style={{ padding: '10px 16px', borderRadius: '10px', border: '1px solid var(--card-border)', backgroundColor: 'var(--card-background)', color: 'var(--text-primary)', cursor: 'pointer' }}
-                                        >
-                                          {isSubmittingReview ? 'Processing...' : 'Regenerate File'}
-                                        </button>
                                       </div>
                                     )}
                                 </>
@@ -2103,45 +2216,77 @@ const Dashboard = ({ user }) => {
                       )}
                     </div>
                     <div style={{ overflowX: 'auto' }}>
-                      <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '1200px' }}>
-                        <thead style={{ backgroundColor: 'var(--background-secondary)', position: 'sticky', top: 0, zIndex: 1 }}>
-                          <tr>
-                            <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>Invoice No</th>
-                            <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>GST Number</th>
-                            <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>Supplier Name</th>
-                            <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>Beneficiary Name</th>
-                            <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>Bank Name</th>
-                            <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>Account Number</th>
-                            <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>IFSC Code</th>
-                            <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>Branch Name</th>
-                            <th style={{ padding: '12px', textAlign: 'right', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>Amount</th>
-                            <th style={{ padding: '12px', textAlign: 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)' }}>Remarks</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {(previewPaymentFile.rows || []).map((row, index) => {
-                            const numericAmount = typeof row.amount === 'number' ? row.amount : parseFloat(row.amount);
-                            const amountDisplay = Number.isFinite(numericAmount) ? numericAmount.toFixed(2) : (row.amount ?? '—');
-                            return (
-                              <tr key={row.id} style={{ 
-                                borderBottom: '1px solid var(--card-border)',
-                                backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.02)'
-                              }}>
-                                <td style={{ padding: '12px' }}>{row.invoice_no || '—'}</td>
-                                <td style={{ padding: '12px' }}>{row.gst_number || '—'}</td>
-                                <td style={{ padding: '12px' }}>{row.supplier_name || '—'}</td>
-                                <td style={{ padding: '12px' }}>{row.beneficiary_name || '—'}</td>
-                                <td style={{ padding: '12px' }}>{row.bank_name || '—'}</td>
-                                <td style={{ padding: '12px' }}>{row.account_number || '—'}</td>
-                                <td style={{ padding: '12px' }}>{row.ifsc_code || '—'}</td>
-                                <td style={{ padding: '12px' }}>{row.branch_name || '—'}</td>
-                                <td style={{ padding: '12px', textAlign: 'right', fontFamily: 'monospace' }}>{amountDisplay}</td>
-                                <td style={{ padding: '12px' }}>{row.remarks || '—'}</td>
+                      {(() => {
+                        const isICICI = previewPaymentFile.payment_type === 'ICICI';
+                        const today = new Date();
+                        const dateStr = `${String(today.getDate()).padStart(2,'0')}-${String(today.getMonth()+1).padStart(2,'0')}-${today.getFullYear()}`;
+                        const pvRef = previewPaymentFile.unique_id || previewPaymentFile.id || '';
+
+                        const cols = isICICI ? [
+                          { label: 'PYMT_PROD_TYPE_CODE', get: () => 'PAB_VENDOR' },
+                          { label: 'PYMT_MODE',           get: () => 'NEFT' },
+                          { label: 'DEBIT_ACC_NO',        get: () => '' },
+                          { label: 'BNF_NAME',            get: row => row.bnf_name || row.supplier_name || '—' },
+                          { label: 'BENE_ACC_NO',         get: row => row.account_number || '—' },
+                          { label: 'BENE_IFSC',           get: row => row.ifsc_code || '—' },
+                          { label: 'AMOUNT',              get: row => { const n = parseFloat(row.amount); return Number.isFinite(n) ? n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'; }, align: 'right' },
+                          { label: 'DEBIT_NARR',          get: () => '' },
+                          { label: 'CREDIT_NARR',         get: () => '' },
+                          { label: 'MOBILE_NUM',          get: row => row.phone || '—' },
+                          { label: 'EMAIL_ID',            get: row => row.email || '—' },
+                          { label: 'REMARK',              get: () => pvRef },
+                          { label: 'PYMT_DATE',           get: () => dateStr },
+                          { label: 'REF_NO',              get: () => '' },
+                          { label: 'ADDL_INFO1',          get: row => row.gst_number || '—' },
+                          { label: 'ADDL_INFO2',          get: () => '' },
+                          { label: 'ADDL_INFO3',          get: () => '' },
+                          { label: 'ADDL_INFO4',          get: () => '' },
+                          { label: 'ADDL_INFO5',          get: () => '' },
+                        ] : [
+                          { label: 'TYPE',                            get: () => 'NEFT' },
+                          { label: 'AMT',                             get: row => { const n = parseFloat(row.amount); return Number.isFinite(n) ? n.toFixed(2) : '—'; }, align: 'right' },
+                          { label: 'DATE',                            get: () => dateStr },
+                          { label: 'DEBIT ACCOUNT NUMBER',            get: () => '' },
+                          { label: 'BEN.NAME',                        get: row => row.supplier_name || '—' },
+                          { label: 'PHONE NUMB',                      get: row => row.phone || '—' },
+                          { label: 'BEN.ACCOU',                       get: row => row.account_number || '—' },
+                          { label: 'IFSC CODE',                       get: row => row.ifsc_code || '—' },
+                          { label: 'PAYMENT INSTRCUCTION',            get: () => 'VENDOR PAYMENT' },
+                          { label: 'COR.REF NO (UNIQUE) PV NUMBER',   get: () => pvRef },
+                          { label: 'PAYABLE CURRENCY',                get: () => 'INR' },
+                          { label: 'BENEFICIARY ADDRESS',             get: row => row.address || '—' },
+                          { label: 'EMAIL',                           get: row => row.email || '—' },
+                          { label: 'BENEFICIARY ADVISE DISPATCH',     get: () => 'E' },
+                        ];
+
+                        return (
+                          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '2200px', fontSize: '0.82rem' }}>
+                            <thead style={{ backgroundColor: 'var(--background-secondary)', position: 'sticky', top: 0, zIndex: 1 }}>
+                              <tr>
+                                {cols.map(col => (
+                                  <th key={col.label} style={{ padding: '10px 12px', textAlign: col.align || 'left', fontWeight: '600', color: 'var(--text-primary)', borderBottom: '2px solid var(--card-border)', whiteSpace: 'nowrap' }}>
+                                    {col.label}
+                                  </th>
+                                ))}
                               </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
+                            </thead>
+                            <tbody>
+                              {(previewPaymentFile.rows || []).map((row, index) => (
+                                <tr key={row.id || index} style={{
+                                  borderBottom: '1px solid var(--card-border)',
+                                  backgroundColor: index % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.02)'
+                                }}>
+                                  {cols.map(col => (
+                                    <td key={col.label} style={{ padding: '10px 12px', textAlign: col.align || 'left', whiteSpace: 'nowrap' }}>
+                                      {col.get(row)}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        );
+                      })()}
                     </div>
                   </>
                 ) : (

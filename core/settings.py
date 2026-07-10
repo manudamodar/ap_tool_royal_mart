@@ -118,6 +118,11 @@ MSAL_AUTHORITY = f"https://login.microsoftonline.com/{MSAL_TENANT_ID}"
 MSAL_REDIRECT_URI = "http://localhost:8000/api/auth/callback"
 MSAL_SCOPES = ["User.ReadBasic.All"]
 
+# Store's own bank account numbers used as DEBIT_ACC_NO in payment files.
+# Set via environment variables or .env file.
+STORE_DEBIT_ACCOUNT_ICICI = os.environ.get('STORE_DEBIT_ACCOUNT_ICICI', '')
+STORE_DEBIT_ACCOUNT_SBI = os.environ.get('STORE_DEBIT_ACCOUNT_SBI', '')
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
