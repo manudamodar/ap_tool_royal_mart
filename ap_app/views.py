@@ -5,10 +5,6 @@ import msal
 import logging
 import requests
 import base64
-import math
-import pandas as pd
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from django.conf import settings
 from django.shortcuts import redirect
 from django.http import JsonResponse, HttpResponse
@@ -16,7 +12,7 @@ from django.urls import reverse
 from django.contrib.auth import login, logout
 from django.contrib.auth.models import User
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Case, IntegerField, Q, Value, When
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.core.files.storage import FileSystemStorage
@@ -28,20 +24,21 @@ from .models import (
     DocumentResult,
     BatchStatus,
     ReconciliationStatus,
-    DueReportUpload,
     DueReportInvoiceWise,
-    DueReportUnknown,
     PaymentFile,
+    PaymentFileInvoice,
+    PaymentFileReviewEvent,
 )
-from .tasks import process_ocr_batch
-from .due_report_service import parse_due_report, extract_gst_from_supplier_name
-from .master_data_utils import get_cash_discount_details
+from .tasks import invoice_row_to_bill, process_ocr_batch
 from .payment_file_service import create_payment_file_record, build_payment_file_rows, generate_payment_file_xlsx
-from .reconciliation_service import build_bill_lookup, match_bill, apply_reconciliation
+from .ap_review_service import compare_bank_file
+from .reconciliation_service import build_bill_lookup, match_bill, apply_reconciliation, sync_due_report_invoice_reconciliation
 
 logger = logging.getLogger(__name__)
 
-GET_BILLS_DEFAULTS = {
+"""Due-report data is fetched from GetBills and stored invoice-wise."""
+
+'''LEGACY_CODE_REMOVED
     "tranYear": "",
     "branchCode": None,
     "branchName": "",
@@ -393,6 +390,8 @@ def _parse_due_report_excel(file_obj):
 
     return rows
 
+LEGACY_CODE_REMOVED'''
+
 def get_msal_app():
     return msal.ConfidentialClientApplication(
         settings.MSAL_CLIENT_ID,
@@ -577,88 +576,6 @@ def change_user_role(request):
 # --- OCR Workflow Views ---
 
 @csrf_exempt
-def upload_due_report(request):
-    """
-    Uploads the due report workbook that becomes the source for GetBills
-    reconciliation data.
-    """
-    if request.method != 'POST':
-        return JsonResponse({"error": "Method not allowed"}, status=405)
-
-    if not request.user.is_authenticated:
-        return JsonResponse({"error": "Unauthorized"}, status=401)
-
-    report_file = request.FILES.get('file')
-    if not report_file:
-        return JsonResponse({"error": "No due report file provided"}, status=400)
-
-    filename = os.path.basename(report_file.name)
-    if not filename.lower().endswith(".xlsx"):
-        return JsonResponse({"error": "Please upload an Excel due report file (.xlsx)."}, status=400)
-
-    try:
-        rows, storage_rows = parse_due_report(report_file)
-    except Exception as e:
-        logger.error(f"Failed to parse due report {filename}: {e}")
-        return JsonResponse({"error": f"Unable to parse due report: {e}"}, status=400)
-
-    if not rows and not storage_rows:
-        return JsonResponse({"error": "No bill rows were found in the due report."}, status=400)
-
-    with transaction.atomic():
-        due_report = DueReportUpload.objects.create(
-            original_filename=filename,
-            uploaded_by=request.user,
-            row_count=len(storage_rows),
-            data=rows,
-        )
-        invoice_wise_count, unknown_count = _persist_due_report_rows(
-            due_report=due_report,
-            rows=storage_rows,
-            uploaded_by=request.user,
-        )
-
-    # Debug logging controlled by settings.LOGGER_MODE_DEBUG
-    if getattr(settings, 'LOGGER_MODE_DEBUG', False):
-        logger.debug("Due report parsed: filename=%s, parsed_rows=%d, storage_rows=%d", filename, len(rows), len(storage_rows))
-        try:
-            logger.debug("Parsed rows sample: %s", rows[:10])
-            logger.debug("Storage rows sample: %s", storage_rows[:10])
-        except Exception:
-            logger.debug("Parsed/storage rows contain non-serializable items; skipping sample output")
-
-    return JsonResponse({
-        "message": "Due report uploaded successfully",
-        "due_report": {
-            "id": due_report.id,
-            "filename": due_report.original_filename,
-            "uploaded_at": due_report.uploaded_at,
-            "row_count": due_report.row_count,
-            "invoice_wise_count": invoice_wise_count,
-            "unknown_count": unknown_count,
-        }
-    }, status=201)
-
-
-def get_current_due_report(request):
-    if not request.user.is_authenticated:
-        return JsonResponse({"error": "Unauthorized"}, status=401)
-
-    due_report = DueReportUpload.objects.filter(uploaded_by=request.user).order_by('-uploaded_at').first()
-    if not due_report:
-        return JsonResponse({"due_report": None})
-
-    return JsonResponse({
-        "due_report": {
-            "id": due_report.id,
-            "filename": due_report.original_filename,
-            "uploaded_at": due_report.uploaded_at,
-            "row_count": due_report.row_count,
-        }
-    })
-
-
-@csrf_exempt
 def upload_batch(request):
     """
     Phase 1: API Ingestion
@@ -671,18 +588,21 @@ def upload_batch(request):
     if not request.user.is_authenticated:
         return JsonResponse({"error": "Unauthorized"}, status=401)
 
-    files = request.FILES.getlist('files')
+    allowed_invoice_extensions = {'.pdf', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.webp'}
+    files = [
+        uploaded_file for uploaded_file in request.FILES.getlist('files')
+        if not os.path.basename(uploaded_file.name).startswith('.')
+        and os.path.splitext(uploaded_file.name)[1].lower() in allowed_invoice_extensions
+    ]
     if not files:
-        return JsonResponse({"error": "No files provided"}, status=400)
+        return JsonResponse({"error": "No supported invoice files provided. Upload PDF or image files."}, status=400)
 
-    due_report = DueReportUpload.objects.filter(uploaded_by=request.user).order_by('-uploaded_at').first()
-    if not due_report:
-        return JsonResponse({"error": "Please upload the due report Excel file before uploading bills."}, status=400)
+    if not DueReportInvoiceWise.objects.exists():
+        return JsonResponse({"error": "Fetch the due report before uploading scanned bills."}, status=400)
 
     # 1. Create the Batch Database record
     batch = OCRBatch.objects.create(
         uploaded_by=request.user,
-        due_report=due_report,
         status=BatchStatus.PENDING,
         total_files=len(files)
     )
@@ -728,11 +648,6 @@ def check_batch_status(request, batch_id):
             "status": batch.status,
             "total_files": batch.total_files,
             "processed_files": batch.processed_files,
-            "due_report": {
-                "id": batch.due_report.id,
-                "filename": batch.due_report.original_filename,
-                "row_count": batch.due_report.row_count,
-            } if batch.due_report else None,
         }
 
         # ALWAYS fetch and return all the parsed data we have so far, to allow real-time UI updates
@@ -792,7 +707,6 @@ def get_user_batches(request):
                 "status": b.status,
                 "total_files": b.total_files,
                 "processed_files": b.processed_files,
-                "due_report_filename": b.due_report.original_filename if b.due_report else None,
                 "representative_file": first_doc_name
             })
             
@@ -863,6 +777,18 @@ def update_document_data(request, document_id):
         if not updates:
              return JsonResponse({"error": "No updates provided"}, status=400)
 
+        editable_fields = {
+            'invoice_number', 'date', 'vendor_name', 'vendor_gst_number',
+            'customer_gst_number', 'total_amount', 'goods_value', 'tax_amount',
+            'hsn_or_sac', 'vendor_bank', 'bank_name', 'account_holder_name',
+            'account_number', 'ifsc_code', 'branch_name', 'micr_code', 'swift_code',
+        }
+        invalid_fields = sorted(set(updates) - editable_fields)
+        if invalid_fields:
+            return JsonResponse({
+                "error": f"These fields cannot be manually edited: {', '.join(invalid_fields)}"
+            }, status=400)
+
         # 1. Update the parsed data
         if document.parsed_data is None:
             document.parsed_data = {}
@@ -874,9 +800,6 @@ def update_document_data(request, document_id):
         actual_changes = {}
 
         for key, value in updates.items():
-            if key == 'tables':
-                continue # Never log tables
-            
             old_val = old_data.get(key)
             if str(old_val) != str(value): # Compare as strings to avoid type issues (e.g. "100" vs 100)
                 actual_changes[key] = {"old": old_val, "new": value}
@@ -895,7 +818,7 @@ def update_document_data(request, document_id):
             full_name = request.user.username
 
         audit_entry = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": timezone.now().isoformat(),
             "action": "Manual Correction",
             "user_name": full_name,
             "user_email": request.user.email,
@@ -910,58 +833,21 @@ def update_document_data(request, document_id):
         document.audit_trail.append(audit_entry)
         
         # 3. Re-run reconciliation
-        fetched_bills = document.batch.due_report.data if document.batch.due_report else call_getbills_api(fin_year="2025_2026")
+        fetched_bills = [
+            invoice_row_to_bill(row)
+            for row in DueReportInvoiceWise.objects.all()
+        ]
         
-        ocr_invoice_number = document.parsed_data.get("invoice_number")
-        ocr_total_amount = document.parsed_data.get("total_amount")
-
-        matched_bill = None
-        reconciliation_details = {}
-
-        if ocr_invoice_number:
-            for bill in fetched_bills:
-                if bill.get("invoiceNo") == ocr_invoice_number:
-                    matched_bill = bill
-                    break
-        
-        if matched_bill:
-            document.matched_bill_data = matched_bill
-            api_payable_amount = matched_bill.get("payable")
-            cash_discount_details = get_cash_discount_details(
-                parsed_data=document.parsed_data,
-                matched_bill_data=matched_bill,
-            )
-            reconciliation_details["cash_discount"] = cash_discount_details
-
-            if ocr_total_amount is not None and api_payable_amount is not None:
-                try:
-                    ocr_amount_decimal = Decimal(str(ocr_total_amount))
-                    api_amount_decimal = Decimal(str(api_payable_amount))
-
-                    if ocr_amount_decimal == api_amount_decimal:
-                        document.reconciliation_status = ReconciliationStatus.MANUALLY_VERIFIED
-                        reconciliation_details["message"] = "Invoice number and total amount matched after manual correction."
-                    else:
-                        document.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
-                        reconciliation_details["message"] = "Manual correction applied, but total amount still differs from the due report."
-                        reconciliation_details["ocr_amount"] = str(ocr_total_amount)
-                        reconciliation_details["api_amount"] = str(api_payable_amount)
-                except InvalidOperation:
-                    document.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
-                    reconciliation_details["message"] = "Manual correction applied, but amount could not be parsed for due report comparison."
-                    reconciliation_details["ocr_amount"] = str(ocr_total_amount)
-                    reconciliation_details["api_amount"] = str(api_payable_amount)
-            else:
-                document.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
-                reconciliation_details["message"] = "Manual correction applied, but amount is missing for due report comparison."
-        else:
-            document.reconciliation_status = ReconciliationStatus.NO_MATCH
-            reconciliation_details["message"] = "Manual correction applied, but no matching bill found in the due report."
-            reconciliation_details["ocr_invoice_number"] = ocr_invoice_number
-            reconciliation_details["ocr_total_amount"] = str(ocr_total_amount) if ocr_total_amount is not None else None
-            
-        document.reconciliation_details = reconciliation_details
-        document.save()
+        bill_lookup = build_bill_lookup(fetched_bills)
+        matched_bill = match_bill(document.parsed_data, bill_lookup)
+        apply_reconciliation(document, document.parsed_data, matched_bill)
+        if document.reconciliation_status == ReconciliationStatus.VERIFIED:
+            document.reconciliation_status = ReconciliationStatus.MANUALLY_VERIFIED
+            details = document.reconciliation_details or {}
+            details['message'] = 'All reconciliation checks passed after manual correction.'
+            document.reconciliation_details = details
+            document.save(update_fields=['reconciliation_status', 'reconciliation_details'])
+            sync_due_report_invoice_reconciliation(document, matched_bill=matched_bill)
         
         # 4. Check if the parent batch status needs to be updated
         batch = document.batch
@@ -1005,29 +891,114 @@ def update_document_data(request, document_id):
 #do not write below this line
 @csrf_exempt
 def get_bills(request):
-    if request.method == 'GET':
-        due_report = DueReportUpload.objects.order_by('-uploaded_at').first()
-        if not due_report:
-            return JsonResponse({
-                "status": "success",
-                "message": "No due report uploaded yet",
-                "data": []
-            })
+    if request.method != 'GET':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+    if not request.user.is_authenticated:
+        return JsonResponse({"error": "Unauthorized"}, status=401)
 
-        invoice_rows = DueReportInvoiceWise.objects.filter(due_report=due_report).order_by('created_at')
-        if invoice_rows.exists():
-            bills = []
-            for row in invoice_rows:
-                bills.append({
+    base_invoice_rows = DueReportInvoiceWise.objects.all()
+    store_options = list(
+        base_invoice_rows.exclude(location_name__isnull=True).exclude(location_name='')
+        .order_by('location_name').values_list('location_name', flat=True).distinct()
+    )
+    search_query = (request.GET.get('q') or '').strip()
+    store_filter = (request.GET.get('store') or '').strip()
+    reconciliation_status_filter = (request.GET.get('status') or '').strip().upper()
+    if search_query:
+        base_invoice_rows = base_invoice_rows.filter(
+            Q(invoice_no__icontains=search_query)
+            | Q(gst_number__icontains=search_query)
+            | Q(supplier_name__icontains=search_query)
+        )
+    if store_filter:
+        base_invoice_rows = base_invoice_rows.filter(location_name=store_filter)
+    if reconciliation_status_filter:
+        if reconciliation_status_filter == 'SCANNED':
+            base_invoice_rows = base_invoice_rows.filter(invoice_scanned=True)
+        elif reconciliation_status_filter == 'SCANNED_NOT_VERIFIED':
+            base_invoice_rows = base_invoice_rows.filter(invoice_scanned=True).exclude(
+                invoice_reconciliation_status__in=[
+                    ReconciliationStatus.VERIFIED,
+                    ReconciliationStatus.MANUALLY_VERIFIED,
+                ]
+            )
+        elif reconciliation_status_filter == 'NOT_SCANNED':
+            base_invoice_rows = base_invoice_rows.filter(invoice_scanned=False)
+        else:
+            base_invoice_rows = base_invoice_rows.filter(
+                invoice_reconciliation_status=reconciliation_status_filter
+            )
+
+    invoice_rows = base_invoice_rows.annotate(
+        reconciliation_priority=Case(
+            When(invoice_scanned=True, invoice_reconciliation_status='VERIFIED', then=Value(0)),
+            When(invoice_scanned=True, invoice_reconciliation_status='MANUALLY_VERIFIED', then=Value(1)),
+            When(invoice_scanned=True, then=Value(2)),
+            default=Value(3),
+            output_field=IntegerField(),
+        )
+    ).order_by('reconciliation_priority', '-created_at', '-id')
+    page_number = request.GET.get('page', 1)
+    try:
+        page_size = min(100, max(1, int(request.GET.get('page_size', 100))))
+    except (TypeError, ValueError):
+        page_size = 100
+    return_all = request.GET.get('all', '').lower() in {'1', 'true', 'yes'}
+    page_obj = None
+    if not return_all:
+        paginator = Paginator(invoice_rows, page_size)
+        try:
+            page_obj = paginator.page(page_number)
+        except (EmptyPage, PageNotAnInteger):
+            page_obj = paginator.page(1)
+        invoice_rows = page_obj.object_list
+    rejected_statuses = [
+        PaymentFileInvoice.Status.MANAGER_REJECTED,
+        PaymentFileInvoice.Status.AP_REJECTED,
+    ]
+    rejected_payment_file_ids = set(PaymentFileInvoice.objects.filter(
+        status__in=rejected_statuses,
+    ).values_list('payment_file_id', flat=True))
+    # The normal generation pool may reuse only line items that were actually
+    # rejected. Approved rows remain locked even when their containing file was
+    # rejected. The dedicated regeneration screen may still select any source row.
+    active_invoice_ids = set(PaymentFileInvoice.objects.exclude(
+        status__in=rejected_statuses,
+    ).values_list('invoice_id', flat=True))
+    rejected_links = PaymentFileInvoice.objects.filter(
+        payment_file_id__in=rejected_payment_file_ids,
+        status__in=[
+            PaymentFileInvoice.Status.MANAGER_REJECTED,
+            PaymentFileInvoice.Status.AP_REJECTED,
+        ],
+    ).select_related('payment_file').order_by('updated_at')
+    latest_rejection_by_invoice = {link.invoice_id: link for link in rejected_links}
+    bills = []
+    for row in invoice_rows:
+        rejection_link = latest_rejection_by_invoice.get(row.id)
+        bills.append({
                     'id': row.id,
+                    'tran_year': row.tran_year,
+                    'branch_code': row.branch_code,
                     'location_name': row.location_name,
+                    'voucher_no': row.voucher_no,
                     'supplier_name': row.supplier_name,
+                    'party_code': row.party_code,
                     'gst_number': row.gst_number,
                     'invoice_no': row.invoice_no,
                     'ref_no': row.ref_no,
                     'bill_voucher_date': row.bill_voucher_date,
+                    'bill_date': row.bill_date,
                     'invoice_date': row.invoice_date,
                     'bill_amount': row.bill_amount,
+                    'payable': row.payable,
+                    'expense_ledger': row.expense_ledger,
+                    'goods_value': row.goods_value,
+                    'tax_amount': row.tax_amount,
+                    'tax_code': row.tax_code,
+                    'tax_type': row.tax_type,
+                    'tds_amount': row.tds_amount,
+                    'tds_section': row.tds_section,
                     'disc_amount': row.disc_amount,
                     'amount_adjusted': row.amount_adjusted,
                     'balance_amount': row.balance_amount,
@@ -1040,36 +1011,95 @@ def get_bills(request):
                     'group_name': row.group_name,
                     'voucher_type': row.voucher_type,
                     'msme_type': row.msme_type,
+                    'party_contact': row.party_contact,
+                    'pay_mode': row.pay_mode,
+                    'other_charges': row.other_charges,
+                    'payment_status': row.payment_status,
+                    'transaction_link': row.transaction_link,
+                    'email_id': row.email_id,
+                    'bill_unique_id': row.bill_unique_id,
                     'status': row.status,
-                    'is_payment_file_created': row.is_payment_file_created,
+                    'invoice_scanned': row.invoice_scanned,
+                    'invoice_reconciliation_status': row.invoice_reconciliation_status,
+                    'invoice_number_matches': row.invoice_number_matches,
+                    'payable_amount_matches': row.payable_amount_matches,
+                    'goods_value_matches': row.goods_value_matches,
+                    'tax_amount_matches': row.tax_amount_matches,
+                    'tax_type_matches': row.tax_type_matches,
+                    'vendor_gst_matches': row.vendor_gst_matches,
+                    'vendor_master_verified': row.vendor_master_verified,
+                    'store_gst_matches': row.store_gst_matches,
+                    'store_master_verified': row.store_master_verified,
+                    'reconciliation_details': row.reconciliation_details,
+                    'is_acknowledged': row.is_acknowledged,
+                    'is_payment_file_created': row.id in active_invoice_ids,
+                    'is_available_for_payment': row.id not in active_invoice_ids,
+                    'payment_file_rejected': rejection_link is not None,
+                    'payment_file_rejection_level': (
+                        'AP' if rejection_link and (rejection_link.status == PaymentFileInvoice.Status.AP_REJECTED or rejection_link.ap_rejection_reason)
+                        else 'MANAGER' if rejection_link else None
+                    ),
+                    'payment_file_rejection_reason': (
+                        rejection_link.ap_rejection_reason or rejection_link.manager_rejection_reason
+                        if rejection_link else None
+                    ),
+                    'rejected_payment_file_id': rejection_link.payment_file_id if rejection_link else None,
                     'manager_rejected': row.manager_rejected,
                     'manager_rejected_at': row.manager_rejected_at,
                     'manager_rejected_by': row.manager_rejected_by.username if row.manager_rejected_by else None,
                     'manager_rejection_reason': row.manager_rejection_reason,
-                })
-        else:
-            fin_year = request.GET.get('finYear')
-            bills = due_report.data or []
-            if fin_year:
-                bills = [bill for bill in bills if str(bill.get("tranYear")) == str(fin_year)]
-
-        return JsonResponse({
-            "status": "success",
-            "message": "success",
-            "source": {
-                "due_report_id": due_report.id,
-                "filename": due_report.original_filename,
-                "uploaded_at": due_report.uploaded_at,
-            },
-            "data": bills
         })
-    return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    return JsonResponse({
+        "status": "success",
+        "message": "success",
+        "source": {"row_count": page_obj.paginator.count if page_obj else len(bills)},
+        "pagination": ({
+            "current_page": page_obj.number,
+            "page_size": page_size,
+            "total_pages": page_obj.paginator.num_pages,
+            "total_items": page_obj.paginator.count,
+            "has_next": page_obj.has_next(),
+            "has_previous": page_obj.has_previous(),
+        } if page_obj else {
+            "current_page": 1,
+            "page_size": len(bills),
+            "total_pages": 1,
+            "total_items": len(bills),
+            "has_next": False,
+            "has_previous": False,
+        }),
+        "filters": {
+            "q": search_query,
+            "store": store_filter,
+            "status": reconciliation_status_filter,
+            "stores": store_options,
+        },
+        "data": bills,
+    })
 
 
 def _get_payment_file_status(payment_file):
-    if payment_file.rejected_due_report_row_ids:
+    links = payment_file.invoice_links.all()
+    if not links.exists():
+        return 'PENDING'
+    statuses = set(links.values_list('status', flat=True))
+    if PaymentFileInvoice.Status.MANAGER_REJECTED in statuses:
         return 'REJECTED'
-    if payment_file.status in [BatchStatus.COMPLETED, BatchStatus.PROCESSING]:
+    if PaymentFileInvoice.Status.AP_REJECTED in statuses:
+        # A single rejected line rejects the complete payment file. The link
+        # statuses still preserve exactly which invoices AP rejected.
+        return 'REJECTED'
+    if statuses and statuses.issubset({PaymentFileInvoice.Status.AP_APPROVED, PaymentFileInvoice.Status.PAID}):
+        if statuses == {PaymentFileInvoice.Status.PAID}:
+            return 'PAID'
+        return 'APPROVED'
+    if statuses and statuses.issubset({
+        PaymentFileInvoice.Status.MANAGER_APPROVED,
+        PaymentFileInvoice.Status.PAID,
+    }):
+        if statuses == {PaymentFileInvoice.Status.PAID}:
+            return 'PAID'
         return 'APPROVED'
     return 'PENDING'
 
@@ -1077,33 +1107,67 @@ def _get_payment_file_status(payment_file):
 def _serialize_payment_file(payment_file, request):
     invoice_rows = list(payment_file.due_report_rows.order_by('id'))
     row_data = build_payment_file_rows(payment_file.payment_type, invoice_rows, overrides=payment_file.line_item_overrides or {})
+    links_by_invoice_id = {
+        link.invoice_id: link
+        for link in payment_file.invoice_links.all()
+    }
 
     for idx, row in enumerate(invoice_rows):
+        link = links_by_invoice_id.get(row.id)
+        review_status = link.status if link else PaymentFileInvoice.Status.PENDING_MANAGER_REVIEW
         row_data[idx].update({
+            'review_status': review_status,
+            'is_approved': review_status in [
+                PaymentFileInvoice.Status.MANAGER_APPROVED,
+                PaymentFileInvoice.Status.AP_APPROVED,
+                PaymentFileInvoice.Status.PAID,
+            ],
+            'is_rejected': review_status in [
+                PaymentFileInvoice.Status.MANAGER_REJECTED,
+                PaymentFileInvoice.Status.AP_REJECTED,
+            ],
+            'review_reason': (link.ap_rejection_reason or link.manager_rejection_reason) if link else None,
+            'ap_rejection_reason': link.ap_rejection_reason if link else None,
             'manager_rejected': row.manager_rejected,
             'manager_rejected_at': row.manager_rejected_at,
             'manager_rejected_by': row.manager_rejected_by.username if row.manager_rejected_by else None,
             'manager_rejection_reason': row.manager_rejection_reason,
         })
 
+    history = [{
+        'event_type': event.event_type,
+        'actor': event.actor.username if event.actor else 'System',
+        'actor_email': event.actor.email if event.actor else None,
+        'comment': event.comment,
+        'invoice_ids': event.invoice_ids or [],
+        'metadata': event.metadata or {},
+        'created_at': event.created_at,
+    } for event in payment_file.review_events.select_related('actor').all()]
+
     return {
         "id": payment_file.id,
         "unique_id": payment_file.unique_id,
         "status": payment_file.status,
         "payment_status": _get_payment_file_status(payment_file),
+        "is_payment_file_approved": payment_file.is_payment_file_approved,
+        "bank_file_matches": payment_file.bank_file_matches,
+        "bank_file_comparison": payment_file.bank_file_comparison or {},
+        "bank_file_uploaded_at": payment_file.bank_file_uploaded_at,
+        "ap_reviewed_at": payment_file.ap_reviewed_at,
         "payment_type": payment_file.payment_type,
         "total_files": payment_file.total_files,
         "processed_files": payment_file.processed_files,
         "download_url": request.build_absolute_uri(reverse('download_payment_file', args=[payment_file.id])),
         "file_name": f"{payment_file.id}_{payment_file.payment_type}.xlsx",
-        "due_report_id": payment_file.due_report.id if payment_file.due_report else None,
-        "due_report_filename": payment_file.due_report.original_filename if payment_file.due_report else None,
         "created_at": payment_file.created_at,
         "created_by": payment_file.created_by.username if payment_file.created_by else None,
         "created_by_id": payment_file.created_by.id if payment_file.created_by else None,
         "created_by_email": payment_file.created_by.email if payment_file.created_by else None,
         "line_item_overrides": payment_file.line_item_overrides or {},
         "rejected_due_report_row_ids": payment_file.rejected_due_report_row_ids or [],
+        "source_payment_file_id": payment_file.source_payment_file_id,
+        "regenerated_file_ids": list(payment_file.regenerated_files.values_list('id', flat=True)),
+        "history": history,
         "rows": row_data,
     }
 
@@ -1116,6 +1180,12 @@ def _require_manager_role(request):
         return profile.role == UserRole.STORE_MANAGER
     except UserProfile.DoesNotExist:
         return False
+
+
+def _require_ap_role(request):
+    if request.user.is_staff:
+        return True
+    return UserProfile.objects.filter(user=request.user, role=UserRole.AP_TEAM).exists()
 
 
 def _is_manager_of(manager_user, target_user):
@@ -1210,20 +1280,46 @@ def review_payment_file(request, payment_file_id):
     rejected_ids = [int(row_id) for row_id in rejected_ids if str(row_id).isdigit()]
     valid_rejected_ids = [row_id for row_id in rejected_ids if row_id in invoice_row_ids]
 
-    if valid_rejected_ids:
-        rows_to_update = DueReportInvoiceWise.objects.filter(id__in=valid_rejected_ids)
-        now = timezone.now()
-        for row in rows_to_update:
-            row.manager_rejected = True
-            row.manager_rejected_at = now
-            row.manager_rejected_by = request.user
-            row.manager_rejection_reason = payload.get('rejection_reason') or row.manager_rejection_reason
-            row.save()
+    now = timezone.now()
+    with transaction.atomic():
+        for link in payment_file.invoice_links.select_for_update():
+            is_rejected = link.invoice_id in valid_rejected_ids
+            link.status = (
+                PaymentFileInvoice.Status.MANAGER_REJECTED
+                if is_rejected else PaymentFileInvoice.Status.MANAGER_APPROVED
+            )
+            link.manager_rejection_reason = payload.get('rejection_reason') if is_rejected else None
+            link.save(update_fields=['status', 'manager_rejection_reason', 'updated_at'])
 
-    payment_file.line_item_overrides = overrides
-    payment_file.rejected_due_report_row_ids = sorted(set(list(payment_file.rejected_due_report_row_ids or []) + valid_rejected_ids))
-    payment_file.modified_by = request.user
-    payment_file.save()
+        rows_to_update = DueReportInvoiceWise.objects.filter(id__in=invoice_row_ids)
+        for row in rows_to_update:
+            is_rejected = row.id in valid_rejected_ids
+            row.manager_rejected = is_rejected
+            row.manager_rejected_at = now if is_rejected else None
+            row.manager_rejected_by = request.user if is_rejected else None
+            row.manager_rejection_reason = payload.get('rejection_reason') if is_rejected else None
+            row.save(update_fields=[
+                'manager_rejected', 'manager_rejected_at', 'manager_rejected_by',
+                'manager_rejection_reason',
+            ])
+
+        payment_file.line_item_overrides = overrides
+        payment_file.rejected_due_report_row_ids = sorted(valid_rejected_ids)
+        payment_file.is_payment_file_approved = not valid_rejected_ids
+        payment_file.status = BatchStatus.COMPLETED if not valid_rejected_ids else BatchStatus.REJECTED
+        payment_file.modified_by = request.user
+        payment_file.save(update_fields=[
+            'line_item_overrides', 'rejected_due_report_row_ids',
+            'is_payment_file_approved', 'status', 'modified_by', 'updated_at',
+        ])
+        PaymentFileReviewEvent.objects.create(
+            payment_file=payment_file,
+            event_type=(PaymentFileReviewEvent.EventType.MANAGER_REJECTED if valid_rejected_ids else PaymentFileReviewEvent.EventType.MANAGER_APPROVED),
+            actor=request.user,
+            comment=payload.get('rejection_reason') or None,
+            invoice_ids=sorted(valid_rejected_ids),
+            metadata={'approved_invoice_ids': sorted(invoice_row_ids - set(valid_rejected_ids))},
+        )
 
     return JsonResponse({"payment_file": _serialize_payment_file(payment_file, request)})
 
@@ -1244,23 +1340,25 @@ def regenerate_payment_file(request, payment_file_id):
     except PaymentFile.DoesNotExist:
         return JsonResponse({"error": "Payment file not found."}, status=404)
 
+    if payment_file.created_by_id != request.user.id and not request.user.is_staff:
+        return JsonResponse({"error": "You can only regenerate your own rejected payment files."}, status=403)
+
+    if _get_payment_file_status(payment_file) != 'REJECTED':
+        return JsonResponse({"error": "Only rejected payment files can be regenerated."}, status=400)
+
     try:
         payload = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
     invoice_ids = payload.get('invoice_ids')
-    if invoice_ids is not None and not isinstance(invoice_ids, list):
-        return JsonResponse({"error": "invoice_ids must be a list if provided."}, status=400)
-
-    if invoice_ids is None:
-        invoice_rows = list(payment_file.due_report_rows.filter(manager_rejected=False))
-    else:
-        invoice_rows = list(DueReportInvoiceWise.objects.filter(
-            id__in=invoice_ids,
-            due_report=payment_file.due_report,
-            manager_rejected=False
-        ))
+    if not isinstance(invoice_ids, list) or not invoice_ids:
+        return JsonResponse({"error": "Select at least one invoice from the rejected payment file."}, status=400)
+    allowed_ids = set(payment_file.due_report_rows.values_list('id', flat=True))
+    selected_ids = {int(row_id) for row_id in invoice_ids if str(row_id).isdigit()}
+    if not selected_ids or selected_ids - allowed_ids:
+        return JsonResponse({"error": "One or more selected invoices do not belong to this payment file."}, status=400)
+    invoice_rows = list(payment_file.due_report_rows.filter(id__in=selected_ids).order_by('id'))
 
     if not invoice_rows:
         return JsonResponse({"error": "No valid invoice rows available for regeneration."}, status=400)
@@ -1273,16 +1371,135 @@ def regenerate_payment_file(request, payment_file_id):
     new_payment_file = create_payment_file_record(
         payment_type=payment_file.payment_type,
         invoice_rows=invoice_rows,
-        due_report=payment_file.due_report,
         created_by=payment_file.created_by or request.user,
         line_item_overrides=overrides_for_new_file,
-        rejected_due_report_row_ids=payment_file.rejected_due_report_row_ids or [],
+        rejected_due_report_row_ids=[],
+        source_payment_file=payment_file,
+    )
+
+    DueReportInvoiceWise.objects.filter(id__in=[row.id for row in invoice_rows]).update(
+        manager_rejected=False,
+        manager_rejected_at=None,
+        manager_rejected_by=None,
+        manager_rejection_reason=None,
+    )
+    PaymentFileReviewEvent.objects.create(
+        payment_file=payment_file,
+        event_type=PaymentFileReviewEvent.EventType.REGENERATED,
+        actor=request.user,
+        invoice_ids=[row.id for row in invoice_rows],
+        metadata={'new_payment_file_id': new_payment_file.id},
     )
 
     return JsonResponse({
         "message": "New payment file generated successfully.",
         "payment_file": _serialize_payment_file(new_payment_file, request)
     }, status=201)
+
+
+@csrf_exempt
+def upload_bank_portal_file(request, payment_file_id):
+    if request.method != 'POST':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+    if not request.user.is_authenticated or not _require_ap_role(request):
+        return JsonResponse({"error": "Only AP Team can upload bank portal files."}, status=403)
+
+    try:
+        payment_file = PaymentFile.objects.get(pk=payment_file_id)
+    except PaymentFile.DoesNotExist:
+        return JsonResponse({"error": "Payment file not found."}, status=404)
+    if _get_payment_file_status(payment_file) != 'APPROVED':
+        return JsonResponse({"error": "Only manager-approved files can be compared."}, status=400)
+
+    uploaded_file = request.FILES.get('file')
+    if not uploaded_file:
+        return JsonResponse({"error": "Bank portal file is required."}, status=400)
+    try:
+        comparison = compare_bank_file(payment_file, uploaded_file)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+
+    uploaded_file.seek(0)
+    payment_file.bank_portal_file.save(uploaded_file.name, uploaded_file, save=False)
+    payment_file.bank_file_matches = comparison['matches']
+    payment_file.bank_file_comparison = comparison
+    payment_file.bank_file_uploaded_at = timezone.now()
+    payment_file.bank_file_uploaded_by = request.user
+    payment_file.save()
+    PaymentFileReviewEvent.objects.create(
+        payment_file=payment_file,
+        event_type=PaymentFileReviewEvent.EventType.BANK_FILE_COMPARED,
+        actor=request.user,
+        invoice_ids=list(payment_file.due_report_rows.values_list('id', flat=True)),
+        metadata=comparison,
+    )
+    return JsonResponse({"payment_file": _serialize_payment_file(payment_file, request)})
+
+
+@csrf_exempt
+def ap_review_payment_file(request, payment_file_id):
+    if request.method != 'POST':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+    if not request.user.is_authenticated or not _require_ap_role(request):
+        return JsonResponse({"error": "Only AP Team can review these files."}, status=403)
+
+    try:
+        payment_file = PaymentFile.objects.get(pk=payment_file_id)
+        payload = json.loads(request.body)
+    except PaymentFile.DoesNotExist:
+        return JsonResponse({"error": "Payment file not found."}, status=404)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    if not payment_file.bank_portal_file:
+        return JsonResponse({"error": "Upload and compare the bank portal file first."}, status=400)
+    rejected_items = payload.get('rejected_items', {})
+    if not isinstance(rejected_items, dict):
+        return JsonResponse({"error": "rejected_items must map invoice IDs to comments."}, status=400)
+    rejected_items = {int(key): str(value).strip() for key, value in rejected_items.items() if str(key).isdigit()}
+    if any(not comment for comment in rejected_items.values()):
+        return JsonResponse({"error": "A comment is required for every AP-rejected line item."}, status=400)
+
+    with transaction.atomic():
+        links = list(payment_file.invoice_links.select_for_update())
+        valid_ids = {link.invoice_id for link in links}
+        if set(rejected_items) - valid_ids:
+            return JsonResponse({"error": "One or more invoice IDs do not belong to this file."}, status=400)
+        for link in links:
+            rejected = link.invoice_id in rejected_items
+            link.status = PaymentFileInvoice.Status.AP_REJECTED if rejected else PaymentFileInvoice.Status.AP_APPROVED
+            link.ap_rejection_reason = rejected_items.get(link.invoice_id)
+            link.save(update_fields=['status', 'ap_rejection_reason', 'updated_at'])
+            if rejected:
+                row = link.invoice
+                row.manager_rejected = True
+                row.manager_rejection_reason = link.ap_rejection_reason
+                row.manager_rejected_at = timezone.now()
+                row.manager_rejected_by = request.user
+                row.save(update_fields=['manager_rejected', 'manager_rejection_reason', 'manager_rejected_at', 'manager_rejected_by'])
+        payment_file.ap_reviewed_at = timezone.now()
+        payment_file.ap_reviewed_by = request.user
+        payment_file.is_payment_file_approved = not rejected_items
+        payment_file.rejected_due_report_row_ids = sorted(rejected_items)
+        payment_file.status = BatchStatus.REJECTED if rejected_items else BatchStatus.COMPLETED
+        payment_file.modified_by = request.user
+        payment_file.save(update_fields=[
+            'ap_reviewed_at', 'ap_reviewed_by', 'is_payment_file_approved',
+            'rejected_due_report_row_ids', 'status', 'modified_by', 'updated_at',
+        ])
+        PaymentFileReviewEvent.objects.create(
+            payment_file=payment_file,
+            event_type=(PaymentFileReviewEvent.EventType.AP_REJECTED if rejected_items else PaymentFileReviewEvent.EventType.AP_APPROVED),
+            actor=request.user,
+            invoice_ids=sorted(rejected_items),
+            metadata={
+                'rejected_items': {str(key): value for key, value in rejected_items.items()},
+                'approved_invoice_ids': sorted(valid_ids - set(rejected_items)),
+                'bank_file_matches': payment_file.bank_file_matches,
+            },
+        )
+
+    return JsonResponse({"payment_file": _serialize_payment_file(payment_file, request)})
 
 
 @csrf_exempt
@@ -1309,17 +1526,18 @@ def central_payment(request):
         if not invoice_rows:
             return JsonResponse({"error": "No due report invoice rows found for the provided IDs."}, status=404)
 
-        if any(row.manager_rejected for row in invoice_rows):
-            return JsonResponse({"error": "One or more selected invoice rows have been rejected by the manager and cannot be included."}, status=400)
-
-        due_report = invoice_rows[0].due_report
-        if any(row.due_report_id != due_report.id for row in invoice_rows):
-            return JsonResponse({"error": "All selected invoice rows must belong to the same due report."}, status=400)
+        active_invoice_ids = set(PaymentFileInvoice.objects.filter(
+            invoice_id__in=invoice_ids,
+        ).exclude(status__in=[
+            PaymentFileInvoice.Status.MANAGER_REJECTED,
+            PaymentFileInvoice.Status.AP_REJECTED,
+        ]).values_list('invoice_id', flat=True))
+        if active_invoice_ids:
+            return JsonResponse({"error": "One or more selected invoices already belong to an active payment file."}, status=400)
 
         payment_file = create_payment_file_record(
             payment_type=payment_type,
             invoice_rows=invoice_rows,
-            due_report=due_report,
             created_by=request.user,
         )
 
@@ -1337,14 +1555,22 @@ def central_payment(request):
                 "download_url": download_url,
                 "file_name": f"{payment_file.id}_{payment_file.payment_type}.xlsx",
                 "file_url": None,
-                "due_report_id": due_report.id,
-                "due_report_filename": due_report.original_filename,
             }
         }, status=201)
 
     if request.method == 'GET':
+        is_ap_team = UserProfile.objects.filter(user=request.user, role=UserRole.AP_TEAM).exists()
         if request.user.is_staff:
             payment_files = PaymentFile.objects.order_by('-created_at')
+        elif is_ap_team:
+            payment_files = PaymentFile.objects.filter(
+                invoice_links__status__in=[
+                    PaymentFileInvoice.Status.MANAGER_APPROVED,
+                    PaymentFileInvoice.Status.AP_APPROVED,
+                    PaymentFileInvoice.Status.AP_REJECTED,
+                    PaymentFileInvoice.Status.PAID,
+                ]
+            ).distinct().order_by('-created_at')
         else:
             payment_files = PaymentFile.objects.filter(
                 Q(created_by=request.user) |
@@ -1363,8 +1589,6 @@ def central_payment(request):
                     "download_url": request.build_absolute_uri(reverse('download_payment_file', args=[payment_file.id])),
                     "file_name": f"{payment_file.id}_{payment_file.payment_type}.xlsx",
                     "file_url": None,
-                    "due_report_id": payment_file.due_report.id if payment_file.due_report else None,
-                    "due_report_filename": payment_file.due_report.original_filename if payment_file.due_report else None,
                     "created_at": payment_file.created_at,
                     "created_by": payment_file.created_by.username if payment_file.created_by else None,
                     "created_by_id": payment_file.created_by.id if payment_file.created_by else None,

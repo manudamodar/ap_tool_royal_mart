@@ -14,6 +14,17 @@ __pycache__/
 # This ignores all migration files but keeps the folders and __init__.py
 **/migrations/*.py
 !**/migrations/__init__.py
+!ap_app/migrations/0002_remove_duereportrowbase_is_from_excel.py
+!ap_app/migrations/0003_rename_ap_app_due_invoice_416127_idx_ap_app_duer_invoice_8ab7dd_idx.py
+!ap_app/migrations/0004_sync_getbills_columns.py
+!ap_app/migrations/0005_ap_payment_review.py
+!ap_app/migrations/0006_payment_file_lifecycle.py
+!ap_app/migrations/0007_reconciliation_flags_and_masters.py
+!ap_app/migrations/0007_backfill_payment_file_history.py
+!ap_app/migrations/0008_merge_0007_migration_branches.py
+!ap_app/migrations/0009_allow_vendor_master_blank_gst.py
+!ap_app/migrations/0010_due_report_reconciliation_flags.py
+!ap_app/migrations/0011_due_report_status_and_comparison_details.py
 
 # --- Frontend (The source of your 37k files) ---
 # This will fix the slow VCS adding issue
@@ -28,4 +39,3 @@ yarn-error.log*
 # --- Virtual Environments ---
 venv/
 env/
-

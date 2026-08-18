@@ -1,0 +1,12 @@
+{% extends "admin/change_form.html" %}
+
+{% block object-tools-items %}
+  {% if original %}
+    <li>
+      <a href="{% url 'admin:ap_app_duereportinvoicewise_reset_single_processing_data' original.pk %}" class="deletelink">
+        Reset This Bill
+      </a>
+    </li>
+  {% endif %}
+  {{ block.super }}
+{% endblock %}

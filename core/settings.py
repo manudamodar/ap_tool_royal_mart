@@ -19,8 +19,8 @@ DEBUG = True
 # LOGGER_MODE_DEBUG=1 or LOGGER_MODE_DEBUG=true
 LOGGER_MODE_DEBUG = os.environ.get('LOGGER_MODE_DEBUG', 'True').strip().lower() in ('1', 'true', 'yes')
 
-ALLOWED_HOSTS = []
-
+ALLOWED_HOSTS = ['*']
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -115,7 +115,7 @@ MSAL_CLIENT_SECRET = os.environ.get("MSAL_CLIENT_SECRET", "dummy_client_secret")
 # Use the common endpoint by default if no tenant ID is specified
 MSAL_TENANT_ID = os.environ.get("MSAL_TENANT_ID", "common")
 MSAL_AUTHORITY = f"https://login.microsoftonline.com/{MSAL_TENANT_ID}"
-MSAL_REDIRECT_URI = "http://localhost:8000/api/auth/callback"
+MSAL_REDIRECT_URI = "https://discounted-responsible-flame-software.trycloudflare.com/api/auth/callback/"
 MSAL_SCOPES = ["User.ReadBasic.All"]
 
 # Store's own bank account numbers used as DEBIT_ACC_NO in payment files.
@@ -138,6 +138,12 @@ LOGGING = {
 }
 
 DATA_UPLOAD_MAX_NUMBER_FILES = 1000  # Allow uploading large folders (default is 100)
+
+# GoFrugal GetBills API configuration. The token is sent as X-Auth-Token.
+EXTERNAL_GETBILLS_URL = os.environ.get('EXTERNAL_GETBILLS_URL', '').strip()
+EXTERNAL_GETBILLS_TOKEN = os.environ.get('EXTERNAL_GETBILLS_TOKEN', '').strip()
+EXTERNAL_GETBILLS_CONNECT_TIMEOUT_SECONDS = int(os.environ.get('EXTERNAL_GETBILLS_CONNECT_TIMEOUT_SECONDS', '15'))
+EXTERNAL_GETBILLS_READ_TIMEOUT_SECONDS = int(os.environ.get('EXTERNAL_GETBILLS_READ_TIMEOUT_SECONDS', '600'))
 
 # Celery Configuration
 CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')

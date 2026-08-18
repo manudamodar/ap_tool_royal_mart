@@ -11,7 +11,7 @@ from django.core.files.base import ContentFile
 
 logger = logging.getLogger(__name__)
 
-from .models import BatchStatus, MasterDataFile, PaymentFile, PaymentFileInvoice, DueReportInvoiceWise, Vendor
+from .models import BatchStatus, MasterDataFile, PaymentFile, PaymentFileInvoice, PaymentFileReviewEvent, DueReportInvoiceWise, Vendor
 
 GST_FIELDS = {
     'supplier gst number', 'suppliergstnumber', 'gst number', 'gstnumber', 'gstin', 'gst'
@@ -314,25 +314,6 @@ def lookup_vendor_bank_details(due_report_row):
         except Exception:
             pass
 
-    # 3. Fallback: due report raw data (the JSON field may contain bank columns)
-    try:
-        due_report = getattr(due_report_row, 'due_report', None)
-        if due_report and due_report.data:
-            for raw_row in due_report.data:
-                raw_gst = _normalize_text(raw_row.get('gst_number') or raw_row.get('GST Number') or raw_row.get('GSTIN') or '')
-                raw_inv = _normalize_text(raw_row.get('invoice_no') or raw_row.get('Invoice No') or '')
-                row_inv = _normalize_text(getattr(due_report_row, 'invoice_no', None) or '')
-                if raw_gst and gst_number and raw_gst == _normalize_text(gst_number):
-                    details = _extract_bank_details(raw_row)
-                    if any(details[field] for field in ['bank_name', 'ifsc_code', 'account_number', 'branch_name']):
-                        return details
-                if raw_inv and row_inv and raw_inv == row_inv:
-                    details = _extract_bank_details(raw_row)
-                    if any(details[field] for field in ['bank_name', 'ifsc_code', 'account_number', 'branch_name']):
-                        return details
-    except Exception:
-        pass
-
     return {}
 
 
@@ -487,10 +468,9 @@ def generate_payment_file_xlsx(payment_type, invoice_rows, payment_ref=''):
     return output.getvalue()
 
 
-def create_payment_file_record(payment_type, invoice_rows, due_report, created_by, line_item_overrides=None, rejected_due_report_row_ids=None, force_selected_ids=None):
+def create_payment_file_record(payment_type, invoice_rows, created_by, line_item_overrides=None, rejected_due_report_row_ids=None, force_selected_ids=None, source_payment_file=None):
     payment_file = PaymentFile.objects.create(
-        due_report=due_report,
-        status=BatchStatus.COMPLETED,
+        status=BatchStatus.PENDING,
         total_files=len(invoice_rows),
         processed_files=len(invoice_rows),
         payment_type=payment_type,
@@ -500,6 +480,7 @@ def create_payment_file_record(payment_type, invoice_rows, due_report, created_b
         rejected_due_report_row_ids=rejected_due_report_row_ids or [],
         is_payment_file_approved=False,
         is_payment_done=False,
+        source_payment_file=source_payment_file,
     )
 
     payment_file.due_report_rows.set([row.id for row in invoice_rows])
@@ -524,6 +505,14 @@ def create_payment_file_record(payment_type, invoice_rows, due_report, created_b
         is_payment_file_created=True,
         manager_rejected=False,
 
+    )
+
+    PaymentFileReviewEvent.objects.create(
+        payment_file=payment_file,
+        event_type=PaymentFileReviewEvent.EventType.CREATED,
+        actor=created_by,
+        invoice_ids=invoice_ids,
+        metadata={'source_payment_file_id': source_payment_file.id if source_payment_file else None},
     )
 
     return payment_file

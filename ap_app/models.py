@@ -94,11 +94,12 @@ class BatchStatus(models.TextChoices):
     REJECTED = 'REJECTED', 'Rejected'
 
 class ReconciliationStatus(models.TextChoices):
-    PENDING = 'PENDING', 'Pending Reconciliation'
     VERIFIED = 'VERIFIED', 'Verified'
-    MANUAL_REVIEW = 'MANUAL_REVIEW', 'Manual Review'
-    NO_MATCH = 'NO_MATCH', 'No Match Found'
-    MANUALLY_VERIFIED = 'MANUALLY_VERIFIED', 'Manually Verified' # Added for post-correction status
+    MANUALLY_VERIFIED = 'MANUALLY_VERIFIED', 'Manually Verified'
+    MANUAL_REVIEW = 'MANUAL_REVIEW', 'Scanned - Needs Review'
+    NO_MATCH = 'NO_MATCH', 'Scanned - No Match'
+    UNVERIFIED = 'UNVERIFIED', 'Scanned - Not Verified'
+    PENDING = 'PENDING', 'Pending Scan/Reconciliation'
 
 def generate_batch_id():
     """Generates a human-readable batch ID like AP_YYYYMMDD_UUID"""
@@ -118,7 +119,6 @@ class OCRBatch(models.Model):
     batch_id = models.CharField(max_length=50, primary_key=True, default=generate_batch_id, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
-    due_report = models.ForeignKey('DueReportUpload', on_delete=models.SET_NULL, null=True, blank=True)
     status = models.CharField(max_length=40, choices=BatchStatus.choices, default=BatchStatus.PENDING)
     total_files = models.IntegerField(default=0)
     processed_files = models.IntegerField(default=0)
@@ -126,43 +126,38 @@ class OCRBatch(models.Model):
     def __str__(self):
         return f"Batch {self.batch_id} - {self.status}"
 
-class DueReportUpload(models.Model):
-    original_filename = models.CharField(max_length=500)
-    uploaded_at = models.DateTimeField(auto_now_add=True)
-    uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
-    row_count = models.IntegerField(default=0)
-    data = models.JSONField(default=list, blank=True)
-
-    def __str__(self):
-        return f"Due Report {self.original_filename} ({self.row_count} rows)"
-
-
 class DueReportRowStatus(models.TextChoices):
     PENDING = 'PENDING', 'Pending'
     READY = 'READY', 'Ready'
     MANUAL_REVIEW = 'MANUAL_REVIEW', 'Manual Review'
 
 
-class DueReportInvoiceReconciliationStatus(models.TextChoices):
-    VERIFIED = 'VERIFIED', 'Verified'
-    UNVERIFIED = 'UNVERIFIED', 'Unverified'
-    MANUALLY_VERIFIED = 'MANUALLY_VERIFIED', 'Manually Verified'
+DueReportInvoiceReconciliationStatus = ReconciliationStatus
 
 
 class DueReportRowBase(models.Model):
-    due_report = models.ForeignKey(DueReportUpload, on_delete=models.CASCADE)
-    uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    tran_year = models.TextField(blank=True, null=True)
+    branch_code = models.BigIntegerField(blank=True, null=True)
     status = models.CharField(max_length=30, choices=DueReportRowStatus.choices, default=DueReportRowStatus.PENDING)
-    is_from_excel = models.BooleanField(default=True)
-    is_from_api = models.BooleanField(default=False)
     location_name = models.TextField(blank=True, null=True)
+    voucher_no = models.TextField(blank=True, null=True)
     supplier_name = models.TextField(blank=True, null=True)
+    party_code = models.BigIntegerField(blank=True, null=True)
     gst_number = models.CharField(max_length=15, blank=True, null=True)
     invoice_no = models.TextField(blank=True, null=True)
     ref_no = models.TextField(blank=True, null=True)
     bill_voucher_date = models.TextField(blank=True, null=True)
+    bill_date = models.TextField(blank=True, null=True)
     invoice_date = models.TextField(blank=True, null=True)
     bill_amount = models.TextField(blank=True, null=True)
+    payable = models.TextField(blank=True, null=True)
+    expense_ledger = models.TextField(blank=True, null=True)
+    goods_value = models.TextField(blank=True, null=True)
+    tax_amount = models.TextField(blank=True, null=True)
+    tax_code = models.TextField(blank=True, null=True)
+    tax_type = models.TextField(blank=True, null=True)
+    tds_amount = models.TextField(blank=True, null=True)
+    tds_section = models.TextField(blank=True, null=True)
     disc_amount = models.TextField(blank=True, null=True)
     amount_adjusted = models.TextField(blank=True, null=True)
     balance_amount = models.TextField(blank=True, null=True)
@@ -175,6 +170,13 @@ class DueReportRowBase(models.Model):
     group_name = models.TextField(blank=True, null=True)
     voucher_type = models.TextField(blank=True, null=True)
     msme_type = models.TextField(blank=True, null=True)
+    party_contact = models.TextField(blank=True, null=True)
+    pay_mode = models.TextField(blank=True, null=True)
+    other_charges = models.TextField(blank=True, null=True)
+    payment_status = models.TextField(blank=True, null=True)
+    transaction_link = models.TextField(blank=True, null=True)
+    email_id = models.TextField(blank=True, null=True)
+    bill_unique_id = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -189,6 +191,16 @@ class DueReportInvoiceWise(DueReportRowBase):
         choices=DueReportInvoiceReconciliationStatus.choices,
         default=DueReportInvoiceReconciliationStatus.UNVERIFIED,
     )
+    invoice_number_matches = models.BooleanField(null=True, blank=True)
+    payable_amount_matches = models.BooleanField(null=True, blank=True)
+    goods_value_matches = models.BooleanField(null=True, blank=True)
+    tax_amount_matches = models.BooleanField(null=True, blank=True)
+    tax_type_matches = models.BooleanField(null=True, blank=True)
+    vendor_gst_matches = models.BooleanField(null=True, blank=True)
+    vendor_master_verified = models.BooleanField(null=True, blank=True)
+    store_gst_matches = models.BooleanField(null=True, blank=True)
+    store_master_verified = models.BooleanField(null=True, blank=True)
+    reconciliation_details = models.JSONField(default=dict, blank=True)
     is_payment_file_created = models.BooleanField(default=False)
     manager_rejected = models.BooleanField(default=False)
     manager_rejection_reason = models.TextField(null=True, blank=True)
@@ -202,7 +214,7 @@ class DueReportInvoiceWise(DueReportRowBase):
             models.UniqueConstraint(fields=['invoice_no', 'gst_number'], name='unique_invoice_gst_number')
         ]
         indexes = [
-            models.Index(fields=['due_report', 'invoice_no', 'gst_number']),
+            models.Index(fields=['invoice_no', 'gst_number']),
         ]
         ordering = ('-created_at',)
 
@@ -210,18 +222,44 @@ class DueReportInvoiceWise(DueReportRowBase):
         return f"{self.invoice_no} - {self.gst_number}"
 
 
-class DueReportUnknown(DueReportRowBase):
+class VendorMaster(models.Model):
+    vendor_id = models.CharField(max_length=50, unique=True)
+    supplier_name = models.CharField(max_length=500)
+    gst_number = models.CharField(max_length=15, blank=True, null=True, db_index=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
     class Meta:
-        verbose_name = 'Due Report Unknown'
-        verbose_name_plural = 'Due Report Unknown'
-        indexes = [
-            models.Index(fields=['due_report']),
-            models.Index(fields=['gst_number']),
-        ]
-        ordering = ('-created_at',)
+        verbose_name = 'Vendor Master'
+        verbose_name_plural = 'Vendor Master'
+        ordering = ('supplier_name',)
 
     def __str__(self):
-        return self.invoice_no or self.supplier_name or f"Unknown Due Report Row {self.id}"
+        return f"{self.supplier_name} - {self.gst_number}"
+
+
+class RoyalMartStoreMaster(models.Model):
+    serial_number = models.CharField(max_length=50, blank=True, null=True)
+    legal_name = models.CharField(max_length=500)
+    store_code = models.CharField(max_length=50, db_index=True)
+    gst_number = models.CharField(max_length=15, db_index=True)
+    address = models.TextField(blank=True, null=True)
+    email_address = models.EmailField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Royal Mart Store Master'
+        verbose_name_plural = 'Royal Mart Store Master'
+        ordering = ('store_code',)
+        constraints = [
+            models.UniqueConstraint(fields=['store_code', 'gst_number'], name='unique_store_code_gst_number')
+        ]
+
+    def __str__(self):
+        return f"{self.store_code} - {self.gst_number}"
 
 
 class MasterDataFile(models.Model):
@@ -463,6 +501,15 @@ class DocumentResult(models.Model):
     )
     matched_bill_data = models.JSONField(null=True, blank=True)
     reconciliation_details = models.JSONField(null=True, blank=True) 
+    invoice_number_matches = models.BooleanField(null=True, blank=True)
+    payable_amount_matches = models.BooleanField(null=True, blank=True)
+    goods_value_matches = models.BooleanField(null=True, blank=True)
+    tax_amount_matches = models.BooleanField(null=True, blank=True)
+    tax_type_matches = models.BooleanField(null=True, blank=True)
+    vendor_gst_matches = models.BooleanField(null=True, blank=True)
+    vendor_master_verified = models.BooleanField(null=True, blank=True)
+    store_gst_matches = models.BooleanField(null=True, blank=True)
+    store_master_verified = models.BooleanField(null=True, blank=True)
     
     # Audit log for tracking changes over the document's lifecycle
     # Format: [{"timestamp": "...", "action": "Scanned", "user": "System", "details": "..."}, ...]
@@ -481,7 +528,6 @@ class PaymentFile(models.Model):
     id = models.CharField(max_length=50, primary_key=True, default=generate_batch_id, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    due_report = models.ForeignKey('DueReportUpload', on_delete=models.SET_NULL, null=True, blank=True)
     payment_type = models.CharField(max_length=20, choices=PaymentType.choices, default=PaymentType.ICICI)
     file = models.FileField(upload_to='payment_files/%Y/%m/%d/', blank=True, null=True)
     due_report_rows = models.ManyToManyField('DueReportInvoiceWise', blank=True, related_name='payment_files')
@@ -493,8 +539,19 @@ class PaymentFile(models.Model):
     rejected_due_report_row_ids = models.JSONField(default=list, blank=True)
     is_payment_file_approved = models.BooleanField(default=False)
     is_payment_done = models.BooleanField(default=False)
+    bank_portal_file = models.FileField(upload_to='bank_portal_files/%Y/%m/%d/', blank=True, null=True)
+    bank_file_matches = models.BooleanField(blank=True, null=True)
+    bank_file_comparison = models.JSONField(default=dict, blank=True)
+    bank_file_uploaded_at = models.DateTimeField(blank=True, null=True)
+    bank_file_uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='uploaded_bank_payment_files')
+    ap_reviewed_at = models.DateTimeField(blank=True, null=True)
+    ap_reviewed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='reviewed_payment_files')
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='created_payment_files')
     modified_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='modified_payment_files')
+    source_payment_file = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='regenerated_files',
+    )
 
     def __str__(self):
         return f"Payment File {self.id} - {self.status}"
@@ -511,12 +568,15 @@ class PaymentFileInvoice(models.Model):
         PENDING_MANAGER_REVIEW = 'PENDING_MANAGER_REVIEW', 'Pending Manager Review'
         MANAGER_APPROVED = 'MANAGER_APPROVED', 'Manager Approved'
         MANAGER_REJECTED = 'MANAGER_REJECTED', 'Manager Rejected'
+        AP_APPROVED = 'AP_APPROVED', 'AP Approved'
+        AP_REJECTED = 'AP_REJECTED', 'AP Rejected'
         PAID = 'PAID', 'Paid'
 
     payment_file = models.ForeignKey(PaymentFile, on_delete=models.CASCADE, related_name='invoice_links')
     invoice = models.ForeignKey('DueReportInvoiceWise', on_delete=models.CASCADE, related_name='payment_file_links')
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.PENDING_MANAGER_REVIEW)
     manager_rejection_reason = models.TextField(null=True, blank=True)
+    ap_rejection_reason = models.TextField(null=True, blank=True)
     force_selected = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -529,4 +589,26 @@ class PaymentFileInvoice(models.Model):
 
     def __str__(self):
         return f"{self.payment_file_id} -> {self.invoice_id} ({self.status})"
+
+
+class PaymentFileReviewEvent(models.Model):
+    class EventType(models.TextChoices):
+        CREATED = 'CREATED', 'Created'
+        MANAGER_APPROVED = 'MANAGER_APPROVED', 'Manager Approved'
+        MANAGER_REJECTED = 'MANAGER_REJECTED', 'Manager Rejected'
+        BANK_FILE_COMPARED = 'BANK_FILE_COMPARED', 'Bank File Compared'
+        AP_APPROVED = 'AP_APPROVED', 'AP Approved'
+        AP_REJECTED = 'AP_REJECTED', 'AP Rejected'
+        REGENERATED = 'REGENERATED', 'Regenerated'
+
+    payment_file = models.ForeignKey(PaymentFile, on_delete=models.CASCADE, related_name='review_events')
+    event_type = models.CharField(max_length=40, choices=EventType.choices)
+    actor = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='payment_file_review_events')
+    comment = models.TextField(blank=True, null=True)
+    invoice_ids = models.JSONField(default=list, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ('created_at', 'id')
     

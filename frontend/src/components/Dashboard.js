@@ -1,18 +1,68 @@
 import React, { useRef, useState, useEffect } from 'react';
 
 const DOCUMENT_DETAIL_FIELDS = [
-  { key: 'date', label: 'Date' },
+  { key: 'invoice_number', label: 'Invoice Number' },
+  { key: 'date', label: 'Invoice Date', inputType: 'date' },
   { key: 'vendor_name', label: 'Vendor Name' },
-  { key: 'vendor_bank', label: 'Vendor Bank' },
-  { key: 'ifsc_code', label: 'IFSC Code' },
-  { key: 'hsn_or_sac', label: 'HSN or SAC' },
   { key: 'vendor_gst_number', label: 'GST Number of Vendor' },
   { key: 'customer_gst_number', label: 'GST Number of Customer' },
-  { key: 'total_amount', label: 'Total Amount' },
-  { key: 'invoice_number', label: 'Invoice Number' },
+  { key: 'total_amount', label: 'Total Amount / Payable', inputType: 'number', step: '0.01' },
+  { key: 'goods_value', label: 'Goods Value', inputType: 'number', step: '0.01' },
+  { key: 'tax_amount', label: 'Tax Amount', inputType: 'number', step: '0.01' },
+  { key: 'hsn_or_sac', label: 'HSN or SAC' },
+  { key: 'vendor_bank', label: 'Vendor Bank' },
+  { key: 'bank_name', label: 'Bank Name' },
+  { key: 'account_holder_name', label: 'Account Holder Name' },
+  { key: 'account_number', label: 'Account Number' },
+  { key: 'ifsc_code', label: 'IFSC Code' },
+  { key: 'branch_name', label: 'Bank Branch' },
+  { key: 'micr_code', label: 'MICR Code' },
+  { key: 'swift_code', label: 'SWIFT Code' },
 ];
 
 const VERIFIED_RECO_STATUSES = ['VERIFIED', 'MANUALLY_VERIFIED'];
+
+const COMMON_INVOICE_FIELDS = [
+  ['Invoice Number', 'invoice_no', 'invoice_number', 'invoice_number_matches'],
+  ['Invoice Date', 'invoice_date', 'date', null],
+  ['Vendor Name', 'supplier_name', 'vendor_name', null],
+  ['Vendor GST', 'gst_number', 'vendor_gst_number', 'vendor_gst_matches'],
+  ['Payable', 'payable', 'total_amount', 'payable_amount_matches'],
+  ['Goods Value', 'goods_value', 'goods_value', 'goods_value_matches'],
+  ['Tax Amount', 'tax_amount', 'tax_amount', 'tax_amount_matches'],
+  ['Tax Type', 'tax_type', 'expected_tax_type', 'tax_type_matches'],
+];
+
+const DUE_REPORT_ONLY_FIELDS = [
+  ['party_code', 'Party Code'], ['location_name', 'Royal Mart Store'],
+  ['branch_code', 'Branch Code'], ['tran_year', 'Financial Year'], ['voucher_no', 'Voucher Number'],
+  ['voucher_type', 'Voucher Type'], ['ref_no', 'Reference Number'], ['bill_unique_id', 'Bill Unique ID'],
+  ['bill_voucher_date', 'Bill Voucher Date'], ['bill_date', 'Bill Date'], ['bill_amount', 'Voucher Amount'],
+  ['tax_code', 'Report Tax Code'], ['tds_amount', 'TDS Amount'],
+  ['tds_section', 'TDS Section'], ['disc_amount', 'Discount Amount'], ['other_charges', 'Other Charges'],
+  ['amount_adjusted', 'Amount Adjusted'], ['balance_amount', 'Balance Amount'], ['pending_adj_amt', 'Pending Adjustment'],
+  ['net_balance', 'Net Balance'], ['no_of_days', 'Due Days'], ['due_date', 'Due Date'],
+  ['over_due_days', 'Overdue Days'], ['prior_date', 'Prior Date'], ['group_name', 'Group Name'],
+  ['expense_ledger', 'Expense Ledger'], ['msme_type', 'MSME Type'], ['pay_mode', 'Payment Mode'],
+  ['payment_status', 'Payment Status'], ['party_contact', 'Party Contact'], ['email_id', 'Email'],
+  ['transaction_link', 'Transaction Link'],
+];
+
+const SCANNED_INVOICE_ONLY_FIELDS = [
+  ['scanned_filename', 'Scanned File'], ['customer_gst_number', 'Customer/Store GST'],
+  ['hsn_or_sac', 'HSN or SAC'], ['vendor_bank', 'Vendor Bank'], ['bank_name', 'Bank Name'],
+  ['account_holder_name', 'Account Holder'], ['account_number', 'Account Number'],
+  ['ifsc_code', 'IFSC Code'], ['branch_name', 'Bank Branch'], ['micr_code', 'MICR Code'],
+  ['swift_code', 'SWIFT Code'],
+];
+
+const RECONCILIATION_FLAG_FIELDS = [
+  ['invoice_number_matches', 'Invoice Number Match'], ['payable_amount_matches', 'Payable Match'],
+  ['goods_value_matches', 'Goods Value Match'], ['tax_amount_matches', 'Tax Amount Match'],
+  ['tax_type_matches', 'Tax Type Match'], ['vendor_gst_matches', 'Vendor GST Match'],
+  ['vendor_master_verified', 'Vendor Master Verified'], ['store_gst_matches', 'Store GST Match'],
+  ['store_master_verified', 'Store Master Verified'],
+];
 
 const normalizeBooleanFlag = (value) => {
   return (value === true) || (String(value).toLowerCase() === 'true') || (value === 1) || (value === '1');
@@ -20,19 +70,27 @@ const normalizeBooleanFlag = (value) => {
 
 const normalizeInvoiceRecoStatus = (value) => {
   const normalized = (value || 'UNVERIFIED').toString().trim().toUpperCase();
-  return ['VERIFIED', 'UNVERIFIED', 'MANUALLY_VERIFIED'].includes(normalized) ? normalized : 'UNVERIFIED';
+  return ['VERIFIED', 'MANUALLY_VERIFIED', 'MANUAL_REVIEW', 'NO_MATCH', 'UNVERIFIED', 'PENDING'].includes(normalized) ? normalized : 'UNVERIFIED';
 };
 
 const Dashboard = ({ user }) => {
   const [role, setRole] = useState(user.role);
   const fileInputRef = useRef(null);
-  const dueReportInputRef = useRef(null);
+  const bankFileInputRef = useRef(null);
 
   // State for tracking upload progress
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [isDueReportUploading, setIsDueReportUploading] = useState(false);
-  const [dueReport, setDueReport] = useState(null);
+  const [isDueReportFetching, setIsDueReportFetching] = useState(false);
+  const [invoiceDataReady, setInvoiceDataReady] = useState(false);
+  const [isDueReportModalOpen, setIsDueReportModalOpen] = useState(false);
+  const [dueReportRows, setDueReportRows] = useState([]);
+  const [dueReportPagination, setDueReportPagination] = useState({ current_page: 1, total_pages: 1, total_items: 0 });
+  const [dueReportStores, setDueReportStores] = useState([]);
+  const [dueReportSearch, setDueReportSearch] = useState('');
+  const [dueReportStoreFilter, setDueReportStoreFilter] = useState('');
+  const [dueReportStatusFilter, setDueReportStatusFilter] = useState('');
+  const [selectedDueReportRow, setSelectedDueReportRow] = useState(null);
 
   // State for tracking processing status
   const [activeBatchId, setActiveBatchId] = useState(null);
@@ -56,6 +114,13 @@ const Dashboard = ({ user }) => {
   const [isFetchingInvoiceRows, setIsFetchingInvoiceRows] = useState(false);
   const [isGeneratingPaymentFile, setIsGeneratingPaymentFile] = useState(false);
   const [paymentFileResult, setPaymentFileResult] = useState(null);
+  const [collapsedInvoiceSections, setCollapsedInvoiceSections] = useState({
+    fresh: false,
+    rejected: false,
+    unverified: true,
+    unscanned: true,
+    approved: true,
+  });
 
   const [paymentFiles, setPaymentFiles] = useState([]);
   const [paymentFilesStatusFilter, setPaymentFilesStatusFilter] = useState('PENDING');
@@ -68,6 +133,10 @@ const Dashboard = ({ user }) => {
   const [reviewRejectedIds, setReviewRejectedIds] = useState([]);
   const [reviewReason, setReviewReason] = useState('');
   const [isSubmittingReview, setIsSubmittingReview] = useState(false);
+  const [isRegeneratingPaymentFile, setIsRegeneratingPaymentFile] = useState(false);
+  const [regenerationInvoiceIds, setRegenerationInvoiceIds] = useState([]);
+  const [apRejectedComments, setApRejectedComments] = useState({});
+  const [isUploadingBankFile, setIsUploadingBankFile] = useState(false);
 
   // State for full-screen payment file preview modal
   const [isPaymentFilePreviewModalOpen, setIsPaymentFilePreviewModalOpen] = useState(false);
@@ -86,10 +155,6 @@ const Dashboard = ({ user }) => {
   useEffect(() => {
     fetchRecentBatches(currentPage);
   }, [role, currentPage]);
-
-  useEffect(() => {
-    fetchCurrentDueReport();
-  }, []);
 
   useEffect(() => {
     const handleRoleUpdate = (event) => {
@@ -148,15 +213,39 @@ const Dashboard = ({ user }) => {
     }
   };
 
-  const fetchCurrentDueReport = async () => {
+  const fetchDueReport = async ({
+    notify = true,
+    page = 1,
+    openTable = false,
+    q = dueReportSearch,
+    store = dueReportStoreFilter,
+    status = dueReportStatusFilter,
+  } = {}) => {
+    setIsDueReportFetching(true);
     try {
-      const response = await fetch('/api/due-report/current/');
+      const params = new URLSearchParams({ page: String(page), page_size: '100' });
+      if (q.trim()) params.set('q', q.trim());
+      if (store) params.set('store', store);
+      if (status) params.set('status', status);
+      const response = await fetch(`/api/rest/payable/getbills?${params.toString()}`);
       const data = await response.json();
       if (response.ok) {
-        setDueReport(data.due_report || null);
+        const rows = Array.isArray(data.data) ? data.data : [];
+        const rowCount = data.pagination?.total_items ?? rows.length;
+        setInvoiceDataReady(rowCount > 0);
+        setDueReportRows(rows);
+        setDueReportPagination(data.pagination || { current_page: 1, total_pages: 1, total_items: rowCount });
+        setDueReportStores(data.filters?.stores || []);
+        if (openTable) setIsDueReportModalOpen(true);
+        if (notify) showNotification(`Due report loaded: ${rowCount} invoices found.`, 'success');
+      } else if (notify) {
+        showNotification(data.error || data.message || 'Unable to fetch due report.', 'error');
       }
     } catch (error) {
-      console.error("Error fetching current due report:", error);
+      console.error("Error fetching due report:", error);
+      if (notify) showNotification('Unable to fetch due report.', 'error');
+    } finally {
+      setIsDueReportFetching(false);
     }
   };
 
@@ -167,17 +256,22 @@ const Dashboard = ({ user }) => {
   };
 
   const handleAction = (actionName) => {
-    if (actionName === "Upload Due Report") {
-      dueReportInputRef.current.click();
+    if (actionName === "Get Due Report") {
+      setDueReportSearch('');
+      setDueReportStoreFilter('');
+      setDueReportStatusFilter('');
+      fetchDueReport({ q: '', store: '', status: '' });
+    } else if (actionName === "View Due Report") {
+      fetchDueReport({ notify: false, page: 1, openTable: true });
     } else if (actionName === "Upload Scanned Copy") {
-      if (!dueReport) {
-        showNotification("Upload the due report Excel file first.", "warning");
+      if (!invoiceDataReady) {
+        showNotification("Get the due report first.", "warning");
         return;
       }
       fileInputRef.current.click();
     } else if (actionName === "Generate Payment File") {
-      if (!dueReport) {
-        showNotification("Upload the due report Excel file first.", "warning");
+      if (!invoiceDataReady) {
+        showNotification("Get the due report first.", "warning");
         return;
       }
       setIsPaymentFileModalOpen(true);
@@ -214,16 +308,10 @@ const Dashboard = ({ user }) => {
     }
   };
 
-  const onDueReportSelected = (event) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    executeDueReportUpload(file);
-  };
-
   const fetchInvoiceRows = async () => {
     setIsFetchingInvoiceRows(true);
     try {
-      const response = await fetch('/api/rest/payable/getbills');
+      const response = await fetch('/api/rest/payable/getbills?all=true');
       const data = await response.json();
       if (response.ok) {
         const rows = Array.isArray(data.data) ? data.data : [];
@@ -232,6 +320,8 @@ const Dashboard = ({ user }) => {
           ...r,
           id: typeof r.id === 'string' ? Number(r.id) : r.id,
           is_payment_file_created: normalizeBooleanFlag(r.is_payment_file_created),
+          is_available_for_payment: normalizeBooleanFlag(r.is_available_for_payment),
+          payment_file_rejected: normalizeBooleanFlag(r.payment_file_rejected),
           manager_rejected: normalizeBooleanFlag(r.manager_rejected),
           invoice_scanned: normalizeBooleanFlag(r.invoice_scanned),
           invoice_reconciliation_status: normalizeInvoiceRecoStatus(r.invoice_reconciliation_status),
@@ -279,7 +369,15 @@ const Dashboard = ({ user }) => {
       const response = await fetch(`/api/rest/central-payment/${paymentFileId}/`);
       const data = await response.json();
       if (response.ok) {
-        setSelectedPaymentFile(data.payment_file || null);
+        const paymentFile = data.payment_file || null;
+        setSelectedPaymentFile(paymentFile);
+        // In a rejected file, carry forward individually approved invoices by
+        // default. Specifically rejected invoices stay optional and unchecked.
+        setRegenerationInvoiceIds(
+          paymentFile?.payment_status === 'REJECTED'
+            ? (paymentFile.rows || []).filter((row) => !row.is_rejected).map((row) => row.id)
+            : []
+        );
         setReviewEdits({});
         setReviewRejectedIds([]);
         setReviewReason('');
@@ -347,16 +445,6 @@ const Dashboard = ({ user }) => {
     setPaymentFilesAccountantFilter('ALL');
   };
 
-  const handleReviewFieldChange = (rowId, field, value) => {
-    setReviewEdits((current) => ({
-      ...current,
-      [rowId]: {
-        ...current[rowId],
-        [field]: value,
-      },
-    }));
-  };
-
   const toggleReviewReject = (rowId) => {
     setReviewRejectedIds((current) =>
       current.includes(rowId) ? current.filter((id) => id !== rowId) : [...current, rowId]
@@ -367,7 +455,7 @@ const Dashboard = ({ user }) => {
     if (!row?.id) return false;
     const isRecoEligible = VERIFIED_RECO_STATUSES.includes(normalizeInvoiceRecoStatus(row.invoice_reconciliation_status));
     if (!row.invoice_scanned || !isRecoEligible) return false;
-    return !row.is_payment_file_created || row.manager_rejected;
+    return row.is_available_for_payment ?? (!row.is_payment_file_created || row.manager_rejected);
   };
 
   const toggleInvoiceSelection = (invoiceId) => {
@@ -465,44 +553,100 @@ const Dashboard = ({ user }) => {
     }
   };
 
-  const executeDueReportUpload = async (file) => {
-    setIsDueReportUploading(true);
+  const uploadBankPortalFile = async (file) => {
+    if (!selectedPaymentFile || !file) return;
+    setIsUploadingBankFile(true);
     const formData = new FormData();
     formData.append('file', file);
-
     try {
-      const response = await fetch('/api/due-report/upload/', {
-        method: 'POST',
-        body: formData
-      });
+      const response = await fetch(`/api/rest/central-payment/${selectedPaymentFile.id}/bank-file/`, { method: 'POST', body: formData });
       const data = await response.json();
-
       if (response.ok) {
-        setDueReport(data.due_report);
-        showNotification(`Due report uploaded: ${data.due_report.row_count} bills loaded.`, "success");
-      } else {
-        showNotification(data.error || "Due report upload failed.", "error");
-      }
+        setSelectedPaymentFile(data.payment_file);
+        showNotification(data.payment_file.bank_file_matches ? 'Bank file matches the approved file.' : 'Bank file does not match the approved file.', data.payment_file.bank_file_matches ? 'success' : 'warning');
+      } else showNotification(data.error || 'Unable to compare bank file.', 'error');
     } catch (error) {
-      console.error("Error uploading due report:", error);
-      showNotification("An error occurred during due report upload.", "error");
+      showNotification('Unable to upload bank portal file.', 'error');
     } finally {
-      setIsDueReportUploading(false);
-      if (dueReportInputRef.current) {
-        dueReportInputRef.current.value = null;
-      }
+      setIsUploadingBankFile(false);
+      if (bankFileInputRef.current) bankFileInputRef.current.value = '';
     }
   };
 
+  const submitApReview = async () => {
+    if (!selectedPaymentFile?.bank_file_comparison || selectedPaymentFile.bank_file_matches == null) {
+      showNotification('Upload and compare the bank portal file first.', 'warning');
+      return;
+    }
+    const rejectedItems = Object.fromEntries(Object.entries(apRejectedComments).filter(([, comment]) => comment.trim()));
+    setIsSubmittingReview(true);
+    try {
+      const response = await fetch(`/api/rest/central-payment/${selectedPaymentFile.id}/ap-review/`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rejected_items: rejectedItems }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setSelectedPaymentFile(data.payment_file);
+        setApRejectedComments({});
+        showNotification('AP review submitted.', 'success');
+        fetchPaymentFiles();
+      } else showNotification(data.error || 'Unable to submit AP review.', 'error');
+    } finally {
+      setIsSubmittingReview(false);
+    }
+  };
+
+  const regenerateRejectedPaymentFile = async () => {
+    if (!selectedPaymentFile) return;
+    setIsRegeneratingPaymentFile(true);
+    try {
+      const response = await fetch(`/api/rest/central-payment/${selectedPaymentFile.id}/regenerate/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invoice_ids: regenerationInvoiceIds }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        showNotification('A new payment file was generated with only the rejected invoice rows.', 'success');
+        setSelectedPaymentFile(data.payment_file || null);
+        setPaymentFilesStatusFilter('PENDING');
+        fetchPaymentFiles();
+      } else {
+        showNotification(data.error || 'Unable to regenerate payment file.', 'error');
+      }
+    } catch (error) {
+      console.error('Error regenerating payment file:', error);
+      showNotification('Unable to regenerate payment file.', 'error');
+    } finally {
+      setIsRegeneratingPaymentFile(false);
+    }
+  };
+
+  const toggleRegenerationInvoice = (invoiceId) => {
+    setRegenerationInvoiceIds((current) => current.includes(invoiceId)
+      ? current.filter((id) => id !== invoiceId)
+      : [...current, invoiceId]);
+  };
+
   const onFilesSelected = (event) => {
-    const files = event.target.files;
-    if (!files || files.length === 0) return;
-    executeFolderUpload(files);
+    const selectedFiles = Array.from(event.target.files || []);
+    const supportedFiles = selectedFiles.filter((file) => {
+      const fileName = (file.name || '').toLowerCase();
+      return !fileName.startsWith('.') && /\.(pdf|png|jpe?g|tiff?|bmp|webp)$/.test(fileName);
+    });
+    if (supportedFiles.length === 0) {
+      showNotification('No supported invoice files found. Select PDF or image files.', 'warning');
+      return;
+    }
+    if (supportedFiles.length !== selectedFiles.length) {
+      showNotification(`${selectedFiles.length - supportedFiles.length} hidden or unsupported file(s) ignored.`, 'info');
+    }
+    executeFolderUpload(supportedFiles);
   };
 
   const executeFolderUpload = async (files) => {
-    if (!dueReport) {
-      showNotification("Upload the due report Excel file first.", "warning");
+    if (!invoiceDataReady) {
+      showNotification("Get the due report first.", "warning");
       return;
     }
 
@@ -739,11 +883,37 @@ const Dashboard = ({ user }) => {
       return stringValue ? stringValue : null;
   };
 
+  const renderReconciliationFlag = (row, fieldName) => {
+    if (!row.invoice_scanned || row[fieldName] === null || row[fieldName] === undefined) return '—';
+    return normalizeBooleanFlag(row[fieldName]) ? '✓' : '✕';
+  };
+
+  const getReconciliationTooltip = (row, fieldName) => {
+    if (!row.invoice_scanned) return 'Invoice not scanned; this check has not run.';
+    const values = row.reconciliation_details?.values || {};
+    const ocr = values.ocr || {};
+    const due = values.due_report || {};
+    const labels = {
+      invoice_number_matches: ['Invoice number', ocr.invoice_number, due.invoice_number],
+      payable_amount_matches: ['Payable amount', ocr.payable_amount, due.payable_amount],
+      goods_value_matches: ['Goods value', ocr.goods_value, due.goods_value],
+      tax_amount_matches: ['Tax amount', ocr.tax_amount, due.tax_amount],
+      tax_type_matches: ['Tax type', values.expected_tax_type, due.tax_type],
+      vendor_gst_matches: ['Vendor GST', ocr.vendor_gst, due.vendor_gst],
+      vendor_master_verified: ['Vendor master', ocr.vendor_gst, row.vendor_master_verified ? 'GST found in Vendor Master' : 'GST not found in Vendor Master'],
+      store_gst_matches: ['Store GST', ocr.customer_gst, row.store_gst_matches ? 'GST matched' : 'GST did not match'],
+      store_master_verified: ['Store master', ocr.customer_gst, row.store_master_verified ? 'GST found in Store Master' : 'GST not found in Store Master'],
+    };
+    const [label, scannedValue, reportValue] = labels[fieldName] || [fieldName, null, null];
+    const result = renderReconciliationFlag(row, fieldName) === '✓' ? 'Matched' : 'Did not match';
+    return `${label}\nScanned invoice: ${scannedValue ?? 'Missing'}\nDue report/master: ${reportValue ?? 'Missing'}\nResult: ${result}`;
+  };
+
   const recoEligibleRows = invoiceRows.filter(
     (row) => row.invoice_scanned && VERIFIED_RECO_STATUSES.includes(normalizeInvoiceRecoStatus(row.invoice_reconciliation_status))
   );
-  const freshInvoiceRows = recoEligibleRows.filter((row) => !row.is_payment_file_created && !row.manager_rejected);
-  const rejectedInvoiceRows = recoEligibleRows.filter((row) => row.manager_rejected);
+  const freshInvoiceRows = recoEligibleRows.filter((row) => !row.is_payment_file_created && !row.payment_file_rejected && !row.manager_rejected);
+  const rejectedInvoiceRows = recoEligibleRows.filter((row) => (row.payment_file_rejected || row.manager_rejected) && isInvoiceSelectableForPayment(row));
   const approvedGeneratedInvoiceRows = recoEligibleRows.filter((row) => row.is_payment_file_created && !row.manager_rejected);
   const unverifiedInvoiceRows = invoiceRows.filter(
     (row) => row.invoice_scanned && !VERIFIED_RECO_STATUSES.includes(normalizeInvoiceRecoStatus(row.invoice_reconciliation_status))
@@ -756,12 +926,13 @@ const Dashboard = ({ user }) => {
     if (!VERIFIED_RECO_STATUSES.includes(normalizeInvoiceRecoStatus(row.invoice_reconciliation_status))) {
       return 'Scanned - Unverified';
     }
-    if (row.manager_rejected) return 'Rejected - can regenerate';
+    if (row.payment_file_rejected || row.manager_rejected) return `${row.payment_file_rejection_level || 'Manager'} rejected - available`;
     if (row.is_payment_file_created) return 'Already Created';
     return row.status || 'Pending';
   };
 
   const renderInvoiceSectionRows = (rows, emptyMessage, sectionKeyPrefix) => {
+    if (collapsedInvoiceSections[sectionKeyPrefix]) return null;
     if (rows.length === 0) {
       return (
         <tr key={`${sectionKeyPrefix}-empty`}>
@@ -793,6 +964,23 @@ const Dashboard = ({ user }) => {
       </tr>
     ));
   };
+
+  const renderInvoiceSectionHeader = (sectionKey, label, count, accentColor = 'var(--primary-accent)') => (
+    <tr>
+      <td colSpan={7} style={{ padding: 0, backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)', fontWeight: '700', position: 'sticky', top: '49px', zIndex: 2, borderTop: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)' }}>
+        <button
+          type="button"
+          onClick={() => setCollapsedInvoiceSections((current) => ({ ...current, [sectionKey]: !current[sectionKey] }))}
+          title={collapsedInvoiceSections[sectionKey] ? `Expand ${label}` : `Collapse ${label}`}
+          aria-expanded={!collapsedInvoiceSections[sectionKey]}
+          style={{ width: '100%', padding: '10px 12px', border: 'none', borderLeft: `4px solid ${accentColor}`, background: 'transparent', color: 'inherit', font: 'inherit', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center', textAlign: 'left' }}
+        >
+          <span>{label} <span style={{ color: 'var(--text-secondary)', fontWeight: '600' }}>({count})</span></span>
+          <span aria-hidden="true" style={{ color: 'var(--text-secondary)', fontSize: '1rem', lineHeight: 1 }}>{collapsedInvoiceSections[sectionKey] ? '▾' : '▴'}</span>
+        </button>
+      </td>
+    </tr>
+  );
 
 
   /* --- UI COMPONENTS --- */
@@ -832,9 +1020,9 @@ const Dashboard = ({ user }) => {
       );
   };
 
-  const FeatureCard = ({ iconSvg, title, description, onClick, isComingSoon, disabled = false, variant = 'default' }) => (
+  const FeatureCard = ({ iconSvg, title, description, onClick, isComingSoon, disabled = false, variant = 'default', innerActionLabel, onInnerAction }) => (
     <div
-      onClick={!isComingSoon && !isUploading && !isDueReportUploading && !disabled ? onClick : undefined}
+      onClick={!isComingSoon && !isUploading && !isDueReportFetching && !disabled ? onClick : undefined}
       style={{
         backgroundColor: 'var(--card-background)',
         padding: '2rem',
@@ -846,19 +1034,19 @@ const Dashboard = ({ user }) => {
         minWidth: '250px',
         color: 'var(--text-primary)',
         transition: 'all 0.3s',
-        cursor: (!isComingSoon && onClick && !isUploading && !isDueReportUploading && !disabled) ? 'pointer' : 'default',
+        cursor: (!isComingSoon && onClick && !isUploading && !isDueReportFetching && !disabled) ? 'pointer' : 'default',
         position: 'relative',
-        opacity: (isComingSoon || disabled || (isUploading && title === "Upload Scanned Copy") || (isDueReportUploading && title === "Upload Due Report")) ? 0.7 : 1,
+        opacity: (isComingSoon || disabled || (isUploading && title === "Upload Scanned Copy") || (isDueReportFetching && title === "Get Due Report")) ? 0.7 : 1,
         borderColor: variant === 'danger' ? '#ff4d4f' : variant === 'success' ? '#52c41a' : 'var(--card-border)'
       }}
       onMouseEnter={(e) => {
-         if(!isComingSoon && onClick && !isUploading && !isDueReportUploading && !disabled) {
+         if(!isComingSoon && onClick && !isUploading && !isDueReportFetching && !disabled) {
              e.currentTarget.style.transform = 'translateY(-5px)';
              e.currentTarget.style.boxShadow = '0 8px 16px var(--shadow-color)';
          }
       }}
       onMouseLeave={(e) => {
-         if(!isComingSoon && onClick && !isUploading && !isDueReportUploading && !disabled) {
+         if(!isComingSoon && onClick && !isUploading && !isDueReportFetching && !disabled) {
              e.currentTarget.style.transform = 'translateY(0)';
              e.currentTarget.style.boxShadow = '0 2px 4px var(--shadow-color)';
          }
@@ -891,6 +1079,20 @@ const Dashboard = ({ user }) => {
         {description}
       </p>
 
+      {innerActionLabel && onInnerAction && (
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onInnerAction();
+          }}
+          disabled={isDueReportFetching}
+          style={{ marginTop: '12px', padding: '9px 16px', borderRadius: '8px', border: '1px solid var(--primary-accent)', backgroundColor: 'transparent', color: 'var(--primary-accent)', fontWeight: 700, cursor: isDueReportFetching ? 'wait' : 'pointer', opacity: isDueReportFetching ? 0.65 : 1 }}
+        >
+          {innerActionLabel}
+        </button>
+      )}
+
       {/* Embedded Upload Progress Bar in the Card */}
       {isUploading && title === "Upload Scanned Copy" && (
           <div style={{ marginTop: '15px' }}>
@@ -903,9 +1105,9 @@ const Dashboard = ({ user }) => {
           </div>
       )}
 
-      {isDueReportUploading && title === "Upload Due Report" && (
+      {isDueReportFetching && title === "Get Due Report" && (
           <div style={{ marginTop: '15px', fontSize: '0.8rem', color: 'var(--primary-accent)', fontWeight: 'bold' }}>
-              Uploading due report...
+              Fetching due report...
           </div>
       )}
     </div>
@@ -933,16 +1135,6 @@ const Dashboard = ({ user }) => {
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
       <polyline points="17 8 12 3 7 8"></polyline>
       <line x1="12" y1="3" x2="12" y2="15"></line>
-    </svg>
-  );
-
-  const ReviewIcon = (
-    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-      <polyline points="14 2 14 8 20 8"></polyline>
-      <line x1="16" y1="13" x2="8" y2="13"></line>
-      <line x1="16" y1="17" x2="8" y2="17"></line>
-      <polyline points="10 9 9 9 8 9"></polyline>
     </svg>
   );
 
@@ -974,7 +1166,10 @@ const Dashboard = ({ user }) => {
       if(statusStr === 'INVOICES_SCANNING_IN_PROCESS') return 'Scanning in Process';
       if(statusStr === 'INVOICES_SCANNED') return 'Verified';
       if(statusStr === 'MANUALLY_VERIFIED') return 'Manually Verified';
-      if(statusStr === 'MANUAL_REVIEW') return 'Needs Review';
+      if(statusStr === 'MANUAL_REVIEW') return 'Scanned - Needs Review';
+      if(statusStr === 'NO_MATCH') return 'Scanned - No Match';
+      if(statusStr === 'UNVERIFIED') return 'Scanned - Not Verified';
+      if(statusStr === 'PENDING') return 'Pending Scan/Reconciliation';
 
       // Fallback
       return statusStr.replace(/_/g, ' ');
@@ -1045,9 +1240,9 @@ const Dashboard = ({ user }) => {
           <div style={{ display: 'flex', gap: '2rem', justifyContent: 'center', flexWrap: 'wrap' }}>
             <FeatureCard
               iconSvg={FolderIcon}
-              title="View Payment Files"
-              description="Access and review generated payment files."
-              isComingSoon={true}
+              title="Review Approved Payment Files"
+              description="Compare manager-approved files with bank portal files and review line items."
+              onClick={() => handleAction("View Approved Payment Files")}
             />
           </div>
         );
@@ -1056,25 +1251,20 @@ const Dashboard = ({ user }) => {
           <div style={{ display: 'flex', gap: '2rem', justifyContent: 'center', flexWrap: 'wrap' }}>
             <FeatureCard
               iconSvg={ReportIcon}
-              title="Upload Due Report"
-              description={dueReport ? `${dueReport.filename} (${dueReport.row_count} bills)` : "Upload the due report Excel file before scanning bills."}
-              onClick={() => handleAction("Upload Due Report")}
-              variant={dueReport ? "success" : "default"}
-            />
-            <input
-              type="file"
-              ref={dueReportInputRef}
-              style={{ display: 'none' }}
-              accept=".xlsx"
-              onChange={onDueReportSelected}
+              title="Get Due Report"
+              description={invoiceDataReady ? "Invoice data loaded from GetBills." : "Fetch the latest invoice data from GetBills."}
+              onClick={() => handleAction("Get Due Report")}
+              variant={invoiceDataReady ? "success" : "default"}
+              innerActionLabel="View Due Report"
+              onInnerAction={() => handleAction("View Due Report")}
             />
 
             <FeatureCard
               iconSvg={UploadIcon}
               title="Upload Scanned Copy"
-              description={dueReport ? "Select a folder containing scanned invoice copies (PDFs, Images)." : "Upload the due report first to enable bill scanning."}
+              description={invoiceDataReady ? "Select a folder containing scanned invoice copies (PDFs, Images)." : "Get invoice data first to enable bill scanning."}
               onClick={() => handleAction("Upload Scanned Copy")}
-              disabled={!dueReport}
+              disabled={!invoiceDataReady}
             />
             <input
               type="file"
@@ -1360,6 +1550,161 @@ const Dashboard = ({ user }) => {
         )}
       </div>
 
+      {isDueReportModalOpen && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10001, padding: '4px' }}>
+          <div style={{ width: 'calc(100vw - 8px)', height: 'calc(100vh - 8px)', maxWidth: 'none', maxHeight: 'none', boxSizing: 'border-box', backgroundColor: 'var(--card-background)', borderRadius: '6px', border: '1px solid var(--card-border)', padding: '7px', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <div style={{ minHeight: '28px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '5px' }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', minWidth: 0 }}>
+                <h2 style={{ margin: 0, color: 'var(--text-primary)', fontSize: '17px', lineHeight: '22px' }}>Due Report</h2>
+                <span style={{ color: 'var(--text-secondary)', fontSize: '12px', whiteSpace: 'nowrap' }}>{dueReportPagination.total_items} invoices · reconciled first</span>
+              </div>
+              <button onClick={() => setIsDueReportModalOpen(false)} aria-label="Close due report" style={{ width: '26px', height: '26px', padding: 0, border: 0, background: 'transparent', color: 'var(--text-secondary)', fontSize: '20px', lineHeight: '24px', cursor: 'pointer' }}>×</button>
+            </div>
+            <div style={{ minHeight: '31px', display: 'flex', alignItems: 'center', gap: '5px', flexWrap: 'nowrap', marginBottom: '5px' }}>
+              <input
+                value={dueReportSearch}
+                onChange={(event) => setDueReportSearch(event.target.value)}
+                onKeyDown={(event) => { if (event.key === 'Enter') fetchDueReport({ notify: false, page: 1 }); }}
+                placeholder="Search invoice, vendor GST or vendor name"
+                style={{ flex: '1 1 260px', minWidth: '180px', height: '30px', boxSizing: 'border-box', padding: '4px 8px', border: '1px solid var(--card-border)', borderRadius: '4px', background: 'var(--background-secondary)', color: 'var(--text-primary)', fontSize: '12px' }}
+              />
+              <select value={dueReportStoreFilter} onChange={(event) => setDueReportStoreFilter(event.target.value)} style={{ width: '190px', height: '30px', boxSizing: 'border-box', padding: '3px 6px', border: '1px solid var(--card-border)', borderRadius: '4px', background: 'var(--background-secondary)', color: 'var(--text-primary)', fontSize: '12px' }}>
+                <option value="">All Royal Mart stores</option>
+                {dueReportStores.map((store) => <option key={store} value={store}>{store}</option>)}
+              </select>
+              <select value={dueReportStatusFilter} onChange={(event) => setDueReportStatusFilter(event.target.value)} style={{ width: '190px', height: '30px', boxSizing: 'border-box', padding: '3px 6px', border: '1px solid var(--card-border)', borderRadius: '4px', background: 'var(--background-secondary)', color: 'var(--text-primary)', fontSize: '12px' }}>
+                <option value="">All statuses</option>
+                <option value="VERIFIED">Verified</option>
+                <option value="MANUALLY_VERIFIED">Manually Verified</option>
+                <option value="SCANNED_NOT_VERIFIED">Scanned - Not Verified (All)</option>
+                <option value="MANUAL_REVIEW">Scanned - Needs Review</option>
+                <option value="NO_MATCH">Scanned - No Match</option>
+                <option value="UNVERIFIED">Scanned - Not Verified</option>
+                <option value="PENDING">Pending Scan/Reconciliation</option>
+                <option value="SCANNED">All Scanned</option>
+                <option value="NOT_SCANNED">Not Scanned</option>
+              </select>
+              <button style={{ height: '30px', padding: '3px 10px', fontSize: '12px' }} onClick={() => fetchDueReport({ notify: false, page: 1 })}>Apply</button>
+              <button onClick={() => {
+                setDueReportSearch('');
+                setDueReportStoreFilter('');
+                setDueReportStatusFilter('');
+                fetchDueReport({ notify: false, page: 1, q: '', store: '', status: '' });
+              }} style={{ height: '30px', padding: '3px 10px', fontSize: '12px' }}>Clear</button>
+            </div>
+            <div style={{ overflow: 'auto', flex: '1 1 0', minHeight: 0, width: '100%', border: '1px solid var(--card-border)', borderRadius: '4px', backgroundColor: 'var(--card-background)' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'auto', minWidth: '2800px', fontSize: '12px', lineHeight: '16px' }}>
+                <thead style={{ position: 'sticky', top: 0, zIndex: 2, backgroundColor: 'var(--background-secondary)' }}>
+                  <tr>
+                    {['Status', 'Invoice No', 'Invoice Date', 'Supplier', 'Vendor GST', 'Branch', 'Party Code', 'Voucher Amount', 'Report Goods Value', 'Report Tax Amount', 'Report Tax Code', 'Report Tax Type', 'TDS Amount', 'Due Days', 'Due Date', 'Payment Status', 'Payable', 'Invoice No Match', 'Payable Match', 'Goods Value Match', 'Tax Amount Match', 'Tax Type Match', 'Vendor GST Match', 'Vendor Master', 'Store GST Match', 'Store Master'].map((label) => (
+                      <th key={label} style={{ height: '26px', boxSizing: 'border-box', padding: '4px 7px', borderRight: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)', textAlign: 'left', whiteSpace: 'nowrap', fontWeight: 600 }}>{label}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {isDueReportFetching ? (
+                    <tr><td colSpan={26} style={{ padding: '30px', textAlign: 'center' }}>Loading due report…</td></tr>
+                  ) : dueReportRows.length === 0 ? (
+                    <tr><td colSpan={26} style={{ padding: '30px', textAlign: 'center', color: 'var(--text-secondary)' }}>No invoices match the selected search and filters.</td></tr>
+                  ) : dueReportRows.map((row) => (
+                    <tr key={row.id} onClick={() => setSelectedDueReportRow(row)} title="View all invoice details" style={{ height: '24px', cursor: 'pointer' }}>
+                      <td style={{ boxSizing: 'border-box', padding: '3px 7px', borderRight: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)', whiteSpace: 'nowrap', fontWeight: 600, color: row.invoice_scanned ? getStatusColor(row.invoice_reconciliation_status).text : 'var(--text-secondary)' }}>{row.invoice_scanned ? formatStatus(row.invoice_reconciliation_status) : 'Not Scanned'}</td>
+                      {[row.invoice_no, row.invoice_date, row.supplier_name, row.gst_number, row.location_name, row.party_code, row.bill_amount, row.goods_value, row.tax_amount, row.tax_code, row.tax_type, row.tds_amount, row.no_of_days, row.due_date, row.payment_status, row.payable].map((value, index) => (
+                        <td key={index} style={{ boxSizing: 'border-box', padding: '3px 7px', borderRight: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)', whiteSpace: 'nowrap' }}>{value ?? '—'}</td>
+                      ))}
+                      {RECONCILIATION_FLAG_FIELDS.map(([fieldName]) => {
+                        const displayValue = renderReconciliationFlag(row, fieldName);
+                        return (
+                          <td key={fieldName} title={getReconciliationTooltip(row, fieldName)} style={{ boxSizing: 'border-box', padding: '3px 7px', borderRight: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)', textAlign: 'center', fontWeight: 700, color: displayValue === '✓' ? 'var(--success)' : displayValue === '✕' ? 'var(--danger)' : 'var(--text-secondary)' }}>
+                            {displayValue}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ minHeight: '28px', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '8px', marginTop: '4px', fontSize: '12px' }}>
+              <button style={{ height: '26px', padding: '2px 9px', fontSize: '12px' }} disabled={!dueReportPagination.has_previous || isDueReportFetching} onClick={() => fetchDueReport({ notify: false, page: dueReportPagination.current_page - 1 })}>Previous</button>
+              <span style={{ color: 'var(--text-primary)' }}>Page {dueReportPagination.current_page} / {dueReportPagination.total_pages}</span>
+              <button style={{ height: '26px', padding: '2px 9px', fontSize: '12px' }} disabled={!dueReportPagination.has_next || isDueReportFetching} onClick={() => fetchDueReport({ notify: false, page: dueReportPagination.current_page + 1 })}>Next</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedDueReportRow && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.68)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 10002, padding: '1rem' }} onClick={() => setSelectedDueReportRow(null)}>
+          <div onClick={(event) => event.stopPropagation()} style={{ width: 'min(1000px, 96vw)', maxHeight: '90vh', overflowY: 'auto', background: 'var(--card-background)', border: '1px solid var(--card-border)', borderRadius: '12px', padding: '24px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', marginBottom: '20px' }}>
+              <div>
+                <h2 style={{ margin: 0, color: 'var(--text-primary)' }}>Invoice {selectedDueReportRow.invoice_no || 'Details'}</h2>
+                <p style={{ margin: '6px 0 0', color: 'var(--text-secondary)' }}>{selectedDueReportRow.supplier_name || 'Unknown vendor'}</p>
+              </div>
+              <button onClick={() => setSelectedDueReportRow(null)} aria-label="Close invoice details" style={{ border: 0, background: 'transparent', color: 'var(--text-secondary)', fontSize: '1.5rem', cursor: 'pointer' }}>×</button>
+            </div>
+            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '18px' }}>
+              <span style={{ padding: '6px 10px', borderRadius: '999px', background: 'var(--background-secondary)', color: getStatusColor(selectedDueReportRow.invoice_reconciliation_status).text, fontWeight: 700 }}>{selectedDueReportRow.invoice_scanned ? formatStatus(selectedDueReportRow.invoice_reconciliation_status) : 'Not Scanned'}</span>
+            </div>
+
+            <h3 style={{ color: 'var(--text-primary)', borderBottom: '1px solid var(--card-border)', paddingBottom: '8px' }}>Common fields and comparison</h3>
+            <div style={{ overflowX: 'auto', border: '1px solid var(--card-border)', borderRadius: '8px' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '700px' }}>
+                <thead style={{ background: 'var(--background-secondary)' }}>
+                  <tr>{['Field', 'Due Report', 'Scanned Invoice', 'Result'].map((label) => <th key={label} style={{ padding: '10px', textAlign: 'left' }}>{label}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {COMMON_INVOICE_FIELDS.map(([label, dueField, scannedField, flagField]) => {
+                    const details = selectedDueReportRow.reconciliation_details || {};
+                    const scannedData = details.scanned_invoice || {};
+                    const dueValue = selectedDueReportRow[dueField];
+                    const scannedValue = scannedField === 'expected_tax_type' ? details.values?.expected_tax_type : scannedData[scannedField];
+                    if ((dueValue === null || dueValue === undefined || dueValue === '') && (scannedValue === null || scannedValue === undefined || scannedValue === '')) return null;
+                    const flag = flagField ? renderReconciliationFlag(selectedDueReportRow, flagField) : '—';
+                    return (
+                      <tr key={label} style={{ borderTop: '1px solid var(--card-border)' }}>
+                        <td style={{ padding: '10px', fontWeight: 700 }}>{label}</td>
+                        <td style={{ padding: '10px', overflowWrap: 'anywhere' }}>{dueValue ?? '—'}</td>
+                        <td style={{ padding: '10px', overflowWrap: 'anywhere' }}>{scannedValue ?? (selectedDueReportRow.invoice_scanned ? 'Missing' : 'Not scanned')}</td>
+                        <td title={flagField ? getReconciliationTooltip(selectedDueReportRow, flagField) : ''} style={{ padding: '10px', fontWeight: 800, color: flag === '✓' ? 'var(--success)' : flag === '✕' ? 'var(--danger)' : 'var(--text-secondary)', cursor: flagField ? 'help' : 'default' }}>{flag}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: '20px', marginTop: '24px' }}>
+              <section>
+                <h3 style={{ color: 'var(--text-primary)', borderBottom: '1px solid var(--card-border)', paddingBottom: '8px' }}>Due-report-only details</h3>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '10px' }}>
+                  {DUE_REPORT_ONLY_FIELDS.map(([fieldName, label]) => {
+                    const value = selectedDueReportRow[fieldName];
+                    if (value === null || value === undefined || value === '') return null;
+                    return <div key={fieldName} style={{ padding: '10px', background: 'var(--background-secondary)', borderRadius: '8px', minWidth: 0 }}><div style={{ color: 'var(--text-secondary)', fontSize: '0.76rem', marginBottom: '4px' }}>{label}</div><div style={{ color: 'var(--text-primary)', fontWeight: 600, overflowWrap: 'anywhere' }}>{value}</div></div>;
+                  })}
+                </div>
+              </section>
+
+              <section>
+                <h3 style={{ color: 'var(--text-primary)', borderBottom: '1px solid var(--card-border)', paddingBottom: '8px' }}>Scanned-invoice-only details</h3>
+                {!selectedDueReportRow.invoice_scanned ? <p style={{ color: 'var(--text-secondary)' }}>Invoice not scanned.</p> : (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '10px' }}>
+                    {SCANNED_INVOICE_ONLY_FIELDS.map(([fieldName, label]) => {
+                      const details = selectedDueReportRow.reconciliation_details || {};
+                      const value = fieldName === 'scanned_filename' ? details.scanned_filename : details.scanned_invoice?.[fieldName];
+                      if (value === null || value === undefined || value === '') return null;
+                      return <div key={fieldName} style={{ padding: '10px', background: 'var(--background-secondary)', borderRadius: '8px', minWidth: 0 }}><div style={{ color: 'var(--text-secondary)', fontSize: '0.76rem', marginBottom: '4px' }}>{label}</div><div style={{ color: 'var(--text-primary)', fontWeight: 600, overflowWrap: 'anywhere' }}>{value}</div></div>;
+                    })}
+                  </div>
+                )}
+              </section>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Payment File Generation Modal */}
       {isPaymentFileModalOpen && (
         <div style={{
@@ -1434,9 +1779,9 @@ const Dashboard = ({ user }) => {
                       {selectedInvoiceIds.length === selectableInvoiceCount && selectableInvoiceCount > 0 ? 'Deselect All' : 'Select All'}
                     </button>
                 </div>
-                <div style={{ marginTop: '1.25rem', border: '1px solid var(--card-border)', borderRadius: '12px', overflow: 'hidden' }}>
+                <div style={{ marginTop: '1.25rem', border: '1px solid var(--card-border)', borderRadius: '12px', overflow: 'auto', maxHeight: '58vh' }}>
                     <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '760px' }}>
-                        <thead style={{ backgroundColor: 'var(--background-secondary)' }}>
+                        <thead style={{ backgroundColor: 'var(--background-secondary)', position: 'sticky', top: 0, zIndex: 4 }}>
                             <tr>
                               <th style={{ padding: '12px 12px', textAlign: 'left' }}></th>
                               <th style={{ padding: '12px 12px', textAlign: 'left' }}>ID</th>
@@ -1462,39 +1807,19 @@ const Dashboard = ({ user }) => {
                                 </tr>
                             ) : (
                               <>
-                                <tr>
-                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#f6ffed', color: '#389e0d', fontWeight: '700' }}>
-                                    Fresh Invoices (Scanned + Verified/Manually Verified) ({freshInvoiceRows.length})
-                                  </td>
-                                </tr>
+                                {renderInvoiceSectionHeader('fresh', 'Fresh Invoices (Scanned + Verified/Manually Verified)', freshInvoiceRows.length, 'var(--success)')}
                                 {renderInvoiceSectionRows(freshInvoiceRows, 'No fresh invoices.', 'fresh')}
 
-                                <tr>
-                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#fff7e6', color: '#d46b08', fontWeight: '700' }}>
-                                    Rejected Invoices ({rejectedInvoiceRows.length})
-                                  </td>
-                                </tr>
+                                {renderInvoiceSectionHeader('rejected', 'Rejected Invoices', rejectedInvoiceRows.length, 'var(--danger)')}
                                 {renderInvoiceSectionRows(rejectedInvoiceRows, 'No rejected invoices.', 'rejected')}
 
-                                <tr>
-                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#fff1f0', color: '#cf1322', fontWeight: '700' }}>
-                                    Unverified Invoices (Scanned but not verified) ({unverifiedInvoiceRows.length})
-                                  </td>
-                                </tr>
+                                {renderInvoiceSectionHeader('unverified', 'Unverified Invoices (Scanned but not verified)', unverifiedInvoiceRows.length, '#d97706')}
                                 {renderInvoiceSectionRows(unverifiedInvoiceRows, 'No unverified invoices.', 'unverified')}
 
-                                <tr>
-                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#f9f0ff', color: '#531dab', fontWeight: '700' }}>
-                                    Unscanned Invoices ({unscannedInvoiceRows.length})
-                                  </td>
-                                </tr>
+                                {renderInvoiceSectionHeader('unscanned', 'Unscanned Invoices', unscannedInvoiceRows.length)}
                                 {renderInvoiceSectionRows(unscannedInvoiceRows, 'No unscanned invoices.', 'unscanned')}
 
-                                <tr>
-                                  <td colSpan={7} style={{ padding: '10px 12px', backgroundColor: '#f0f5ff', color: '#1d39c4', fontWeight: '700' }}>
-                                    Already Generated & Approved Invoices ({approvedGeneratedInvoiceRows.length})
-                                  </td>
-                                </tr>
+                                {renderInvoiceSectionHeader('approved', 'Already Generated & Approved Invoices', approvedGeneratedInvoiceRows.length, 'var(--success)')}
                                 {renderInvoiceSectionRows(approvedGeneratedInvoiceRows, 'No already-generated approved invoices.', 'approved')}
                               </>
                             )}
@@ -1782,15 +2107,65 @@ const Dashboard = ({ user }) => {
                                           Download Excel
                                         </a>
                                       )}
+                                      {role === 'STORE_ACCOUNTANT' && selectedPaymentFile.payment_status === 'REJECTED' && (
+                                        <button
+                                          type="button"
+                                          onClick={regenerateRejectedPaymentFile}
+                                          disabled={isRegeneratingPaymentFile || regenerationInvoiceIds.length === 0}
+                                          style={{ padding: '10px 16px', borderRadius: '10px', border: 'none', backgroundColor: 'var(--danger)', color: '#fff', cursor: 'pointer', fontWeight: '600', opacity: isRegeneratingPaymentFile ? 0.6 : 1 }}
+                                        >
+                                          {isRegeneratingPaymentFile ? 'Regenerating...' : `Generate New File (${regenerationInvoiceIds.length})`}
+                                        </button>
+                                      )}
+                                      {role === 'AP_TEAM' && selectedPaymentFile.payment_status === 'APPROVED' && (
+                                        <>
+                                          <button type="button" onClick={() => bankFileInputRef.current?.click()} disabled={isUploadingBankFile} style={{ padding: '10px 16px', borderRadius: '10px', border: '1px solid var(--card-border)', backgroundColor: 'var(--card-background)', color: 'var(--primary-accent)', cursor: 'pointer', fontWeight: '600' }}>
+                                            {isUploadingBankFile ? 'Comparing...' : 'Upload Bank Portal File'}
+                                          </button>
+                                          <input ref={bankFileInputRef} type="file" accept=".xlsx,.xls,.xlsm,.csv" style={{ display: 'none' }} onChange={(event) => uploadBankPortalFile(event.target.files?.[0])} />
+                                        </>
+                                      )}
                                     </div>
+
+                                    {role === 'AP_TEAM' && selectedPaymentFile.bank_file_matches != null && (
+                                      <div style={{ padding: '12px 16px', marginBottom: '1rem', borderRadius: '10px', border: `1px solid ${selectedPaymentFile.bank_file_matches ? 'var(--success)' : 'var(--danger)'}`, color: selectedPaymentFile.bank_file_matches ? 'var(--success)' : 'var(--danger)', fontWeight: '700' }}>
+                                        {selectedPaymentFile.bank_file_matches ? 'Bank portal file matches the manager-approved file.' : 'Bank portal file does not match the manager-approved file.'}
+                                        <div style={{ fontSize: '0.85rem', fontWeight: '400', marginTop: '4px' }}>
+                                          Expected {selectedPaymentFile.bank_file_comparison?.expected_rows || 0}, uploaded {selectedPaymentFile.bank_file_comparison?.uploaded_rows || 0}, missing {selectedPaymentFile.bank_file_comparison?.missing_rows || 0}, unexpected {selectedPaymentFile.bank_file_comparison?.unexpected_rows || 0}.
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {(selectedPaymentFile.history || []).length > 0 && (
+                                      <div style={{ marginBottom: '1.25rem', padding: '14px 16px', border: '1px solid var(--card-border)', borderRadius: '12px', backgroundColor: 'var(--card-background)' }}>
+                                        <div style={{ fontWeight: '700', marginBottom: '10px' }}>Payment File History</div>
+                                        {(selectedPaymentFile.history || []).map((event, index) => (
+                                          <div key={`${event.event_type}-${event.created_at}-${index}`} style={{ padding: '9px 0', borderTop: index ? '1px solid var(--card-border)' : 'none', display: 'grid', gridTemplateColumns: '160px minmax(140px, 1fr) 2fr', gap: '12px', fontSize: '0.88rem' }}>
+                                            <span style={{ fontWeight: '700' }}>{event.event_type.replaceAll('_', ' ')}</span>
+                                            <span>{event.actor || 'System'}<br/><small style={{ color: 'var(--text-secondary)' }}>{event.created_at ? new Date(event.created_at).toLocaleString() : ''}</small></span>
+                                            <span style={{ color: 'var(--text-secondary)' }}>
+                                              {event.comment || event.metadata?.new_payment_file_id || (event.invoice_ids?.length ? `${event.invoice_ids.length} invoice(s)` : '—')}
+                                            </span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
 
                                     <div style={{ marginBottom: '1.25rem' }}>
                                       <div style={{ fontWeight: '600', color: 'var(--text-primary)', marginBottom: '0.75rem' }}>Invoice Line Items</div>
+                                      {role === 'STORE_ACCOUNTANT' && selectedPaymentFile.payment_status === 'REJECTED' && (
+                                        <div style={{ color: 'var(--text-secondary)', fontSize: '0.88rem', marginBottom: '0.75rem' }}>
+                                          Approved invoices are selected by default. Rejected invoices are unchecked, but you can include them if needed.
+                                        </div>
+                                      )}
                                       <div style={{ border: '1px solid var(--card-border)', borderRadius: '12px', overflow: 'hidden', backgroundColor: 'var(--card-background)' }}>
                                         <div style={{ maxHeight: '340px', overflowY: 'auto', overflowX: 'auto' }}>
                                           <table style={{ width: '100%', minWidth: '860px', borderCollapse: 'collapse' }}>
                                             <thead style={{ backgroundColor: 'var(--background-secondary)', position: 'sticky', top: 0, zIndex: 1 }}>
                                               <tr>
+                                                {role === 'STORE_ACCOUNTANT' && selectedPaymentFile.payment_status === 'REJECTED' && (
+                                                  <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Include</th>
+                                                )}
                                                 {role === 'STORE_MANAGER' && !(selectedPaymentFile.payment_status === 'APPROVED' || selectedPaymentFile.payment_status === 'PAID' || selectedPaymentFile.is_payment_file_approved) && (
                                                   <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Reject</th>
                                                 )}
@@ -1800,6 +2175,7 @@ const Dashboard = ({ user }) => {
                                                 <th style={{ padding: '12px', textAlign: 'right', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Amount</th>
                                                 <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Review Status</th>
                                                 <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Reason</th>
+                                                {role === 'AP_TEAM' && <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>AP Rejection Comment</th>}
                                               </tr>
                                             </thead>
                                             <tbody>
@@ -1809,6 +2185,11 @@ const Dashboard = ({ user }) => {
                                                 const isPaymentFileLocked = selectedPaymentFile.payment_status === 'APPROVED' || selectedPaymentFile.payment_status === 'PAID' || selectedPaymentFile.is_payment_file_approved;
                                                 return (
                                                   <tr key={row.id || `${row.invoice_no}-${index}`} style={{ borderBottom: '1px solid var(--card-border)', backgroundColor: isChecked ? 'rgba(255, 77, 79, 0.08)' : (index % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.02)') }}>
+                                                    {role === 'STORE_ACCOUNTANT' && selectedPaymentFile.payment_status === 'REJECTED' && (
+                                                      <td style={{ padding: '12px' }}>
+                                                        <input type="checkbox" checked={regenerationInvoiceIds.includes(row.id)} onChange={() => toggleRegenerationInvoice(row.id)} />
+                                                      </td>
+                                                    )}
                                                     {role === 'STORE_MANAGER' && !isPaymentFileLocked && (
                                                       <td style={{ padding: '12px' }}>
                                                         <input
@@ -1827,7 +2208,12 @@ const Dashboard = ({ user }) => {
                                                         {isChecked ? 'Marked Rejected' : reviewMeta.label}
                                                       </span>
                                                     </td>
-                                                    <td style={{ padding: '12px', color: 'var(--text-secondary)' }}>{row.review_reason || row.manager_rejection_reason || '—'}</td>
+                                                    <td style={{ padding: '12px', color: 'var(--text-secondary)' }}>{row.ap_rejection_reason || row.review_reason || row.manager_rejection_reason || '—'}</td>
+                                                    {role === 'AP_TEAM' && (
+                                                      <td style={{ padding: '12px' }}>
+                                                        <input type="text" value={apRejectedComments[row.id] || ''} onChange={(event) => setApRejectedComments((current) => ({ ...current, [row.id]: event.target.value }))} placeholder="Enter comment to reject this line" style={{ minWidth: '240px', padding: '8px', borderRadius: '8px', border: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)' }} />
+                                                      </td>
+                                                    )}
                                                   </tr>
                                                 );
                                               })}
@@ -1860,6 +2246,13 @@ const Dashboard = ({ user }) => {
                                             {isSubmittingReview ? 'Submitting...' : 'Submit Review'}
                                           </button>
                                         </div>
+                                      </div>
+                                    )}
+                                    {role === 'AP_TEAM' && selectedPaymentFile.payment_status === 'APPROVED' && (
+                                      <div style={{ borderTop: '1px solid var(--card-border)', paddingTop: '1rem' }}>
+                                        <button onClick={submitApReview} disabled={isSubmittingReview || selectedPaymentFile.bank_file_matches == null} style={{ padding: '10px 16px', borderRadius: '10px', border: 'none', backgroundColor: 'var(--primary-accent)', color: '#fff', cursor: 'pointer', opacity: selectedPaymentFile.bank_file_matches == null ? 0.6 : 1 }}>
+                                          {isSubmittingReview ? 'Submitting...' : 'Submit AP Review'}
+                                        </button>
                                       </div>
                                     )}
                                 </>
@@ -1923,14 +2316,15 @@ const Dashboard = ({ user }) => {
                           </div>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-                          {selectedDocument.reconciliation_status !== 'VERIFIED' && selectedDocument.reconciliation_status !== 'MANUALLY_VERIFIED' && (
-                              <button
-                                  onClick={() => setIsEditingDoc(!isEditingDoc)}
-                                  style={{ padding: '8px 16px', backgroundColor: isEditingDoc ? 'var(--background-secondary)' : 'var(--primary-accent)', color: isEditingDoc ? 'var(--text-primary)' : 'white', border: isEditingDoc ? '1px solid var(--card-border)' : 'none' }}
-                              >
-                                  {isEditingDoc ? 'Cancel Editing' : 'Manual Correction'}
-                              </button>
-                          )}
+                          <button
+                              onClick={() => {
+                                  if (isEditingDoc) setEditDocData(selectedDocument.parsed_data || {});
+                                  setIsEditingDoc(!isEditingDoc);
+                              }}
+                              style={{ padding: '8px 16px', backgroundColor: isEditingDoc ? 'var(--background-secondary)' : 'var(--primary-accent)', color: isEditingDoc ? 'var(--text-primary)' : 'white', border: isEditingDoc ? '1px solid var(--card-border)' : 'none' }}
+                          >
+                              {isEditingDoc ? 'Cancel Editing' : 'Manual Correction'}
+                          </button>
                           <button
                               onClick={closeDocumentModal}
                               style={{ background: 'none', border: 'none', fontSize: '1.5rem', cursor: 'pointer', color: 'var(--text-secondary)', padding: '0 8px' }}
@@ -1951,27 +2345,22 @@ const Dashboard = ({ user }) => {
                                   <div style={{ backgroundColor: 'var(--background-secondary)', borderRadius: '8px', border: '1px solid var(--card-border)', overflow: 'hidden' }}>
 
                                       {isEditingDoc ? (
-                                          <div style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                                              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                                                  <label style={{ fontSize: '0.9rem', fontWeight: '600', color: 'var(--text-secondary)' }}>Invoice Number</label>
-                                                  <input
-                                                      type="text"
-                                                      name="invoice_number"
-                                                      value={editDocData.invoice_number || ''}
-                                                      onChange={handleEditDocChange}
-                                                      style={{ padding: '10px', borderRadius: '6px', border: '1px solid var(--primary-accent)', backgroundColor: 'var(--card-background)', color: 'var(--text-primary)', fontSize: '1rem' }}
-                                                  />
-                                              </div>
-                                              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                                                  <label style={{ fontSize: '0.9rem', fontWeight: '600', color: 'var(--text-secondary)' }}>Total Amount / Payable</label>
-                                                  <input
-                                                      type="number"
-                                                      step="0.01"
-                                                      name="total_amount"
-                                                      value={editDocData.total_amount || ''}
-                                                      onChange={handleEditDocChange}
-                                                      style={{ padding: '10px', borderRadius: '6px', border: '1px solid var(--primary-accent)', backgroundColor: 'var(--card-background)', color: 'var(--text-primary)', fontSize: '1rem' }}
-                                                  />
+                                          <div style={{ padding: '1rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '10px 12px' }}>
+                                                  {DOCUMENT_DETAIL_FIELDS.map(({ key, label, inputType = 'text', step }) => (
+                                                      <div key={key} style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                                          <label htmlFor={`manual-${key}`} style={{ fontSize: '0.8rem', fontWeight: '600', color: 'var(--text-secondary)' }}>{label}</label>
+                                                          <input
+                                                              id={`manual-${key}`}
+                                                              type={inputType}
+                                                              step={step}
+                                                              name={key}
+                                                              value={editDocData[key] ?? ''}
+                                                              onChange={handleEditDocChange}
+                                                              style={{ height: '34px', boxSizing: 'border-box', padding: '6px 8px', borderRadius: '4px', border: '1px solid var(--primary-accent)', backgroundColor: 'var(--card-background)', color: 'var(--text-primary)', fontSize: '0.9rem' }}
+                                                          />
+                                                      </div>
+                                                  ))}
                                               </div>
                                               <button
                                                 onClick={saveDocumentChanges}

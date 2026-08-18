@@ -1,0 +1,18 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+  <h1>Reset this bill</h1>
+  <p>
+    Reset scanning, reconciliation flags, acknowledgement, and manager-rejection data for
+    <strong>{{ bill.invoice_no }}</strong> — {{ bill.supplier_name }}?
+  </p>
+  <p>Fields fetched from GoFrugal and existing payment-file history will be preserved.</p>
+
+  <form method="post">
+    {% csrf_token %}
+    <div class="submit-row">
+      <input type="submit" value="Confirm reset" class="deletelink">
+      <a href="{% url 'admin:ap_app_duereportinvoicewise_change' bill.pk %}" class="button cancel-link">Cancel</a>
+    </div>
+  </form>
+{% endblock %}
