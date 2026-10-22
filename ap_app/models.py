@@ -185,6 +185,7 @@ class DueReportRowBase(models.Model):
 
 class DueReportInvoiceWise(DueReportRowBase):
     is_acknowledged = models.BooleanField(default=False)
+    payment_reference_number = models.TextField(blank=True, null=True)
     invoice_scanned = models.BooleanField(default=False)
     invoice_reconciliation_status = models.CharField(
         max_length=20,
@@ -538,6 +539,8 @@ class PaymentFile(models.Model):
     line_item_overrides = models.JSONField(default=dict, blank=True)
     rejected_due_report_row_ids = models.JSONField(default=list, blank=True)
     is_payment_file_approved = models.BooleanField(default=False)
+    is_ap_approved = models.BooleanField(default=False)
+    is_ap_rejected = models.BooleanField(default=False)
     is_payment_done = models.BooleanField(default=False)
     bank_portal_file = models.FileField(upload_to='bank_portal_files/%Y/%m/%d/', blank=True, null=True)
     bank_file_matches = models.BooleanField(blank=True, null=True)
@@ -577,6 +580,8 @@ class PaymentFileInvoice(models.Model):
     status = models.CharField(max_length=50, choices=Status.choices, default=Status.PENDING_MANAGER_REVIEW)
     manager_rejection_reason = models.TextField(null=True, blank=True)
     ap_rejection_reason = models.TextField(null=True, blank=True)
+    is_ap_approved = models.BooleanField(default=False)
+    is_ap_rejected = models.BooleanField(default=False)
     force_selected = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

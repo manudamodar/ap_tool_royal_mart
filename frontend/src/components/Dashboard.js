@@ -56,14 +56,6 @@ const SCANNED_INVOICE_ONLY_FIELDS = [
   ['swift_code', 'SWIFT Code'],
 ];
 
-const RECONCILIATION_FLAG_FIELDS = [
-  ['invoice_number_matches', 'Invoice Number Match'], ['payable_amount_matches', 'Payable Match'],
-  ['goods_value_matches', 'Goods Value Match'], ['tax_amount_matches', 'Tax Amount Match'],
-  ['tax_type_matches', 'Tax Type Match'], ['vendor_gst_matches', 'Vendor GST Match'],
-  ['vendor_master_verified', 'Vendor Master Verified'], ['store_gst_matches', 'Store GST Match'],
-  ['store_master_verified', 'Store Master Verified'],
-];
-
 const normalizeBooleanFlag = (value) => {
   return (value === true) || (String(value).toLowerCase() === 'true') || (value === 1) || (value === '1');
 };
@@ -71,6 +63,12 @@ const normalizeBooleanFlag = (value) => {
 const normalizeInvoiceRecoStatus = (value) => {
   const normalized = (value || 'UNVERIFIED').toString().trim().toUpperCase();
   return ['VERIFIED', 'MANUALLY_VERIFIED', 'MANUAL_REVIEW', 'NO_MATCH', 'UNVERIFIED', 'PENDING'].includes(normalized) ? normalized : 'UNVERIFIED';
+};
+
+const getFormattedDownloadUrl = (url, format) => {
+  if (!url) return '';
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}format=${format}`;
 };
 
 const Dashboard = ({ user }) => {
@@ -111,6 +109,7 @@ const Dashboard = ({ user }) => {
   const [invoiceRows, setInvoiceRows] = useState([]);
   const [selectedInvoiceIds, setSelectedInvoiceIds] = useState([]);
   const [paymentType, setPaymentType] = useState('ICICI');
+  const [paymentFileFormat, setPaymentFileFormat] = useState('xlsx');
   const [isFetchingInvoiceRows, setIsFetchingInvoiceRows] = useState(false);
   const [isGeneratingPaymentFile, setIsGeneratingPaymentFile] = useState(false);
   const [paymentFileResult, setPaymentFileResult] = useState(null);
@@ -380,6 +379,7 @@ const Dashboard = ({ user }) => {
         );
         setReviewEdits({});
         setReviewRejectedIds([]);
+        setApRejectedComments({});
         setReviewReason('');
       } else {
         showNotification(data.error || 'Unable to load payment file details.', 'error');
@@ -489,15 +489,24 @@ const Dashboard = ({ user }) => {
       const response = await fetch('/api/rest/central-payment', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ invoice_ids: selectedInvoiceIds, payment_type: paymentType }),
+        body: JSON.stringify({ invoice_ids: selectedInvoiceIds, payment_type: paymentType, file_format: paymentFileFormat }),
       });
       const data = await response.json();
       if (response.ok) {
+        const processedInvoiceIds = Array.isArray(data.processed_invoice_ids)
+          ? data.processed_invoice_ids
+          : selectedInvoiceIds;
+        const failedInvoices = Array.isArray(data.failed_invoices) ? data.failed_invoices : [];
         setPaymentFileResult(data.payment_file || null);
-        showNotification('Payment file generated successfully.', 'success');
+        showNotification(
+          failedInvoices.length
+            ? `Payment file generated for ${processedInvoiceIds.length} invoice(s); ${failedInvoices.length} invoice(s) failed TrueBooks processing.`
+            : 'Payment file generated successfully.',
+          failedInvoices.length ? 'warning' : 'success'
+        );
         setInvoiceRows((currentRows) =>
           currentRows.map((row) =>
-            selectedInvoiceIds.includes(row.id)
+            processedInvoiceIds.includes(row.id)
               ? {
                   ...row,
                   is_payment_file_created: true,
@@ -508,7 +517,7 @@ const Dashboard = ({ user }) => {
               : row
           )
         );
-        setSelectedInvoiceIds([]);
+        setSelectedInvoiceIds(failedInvoices.map((invoice) => invoice.id));
       } else {
         showNotification(data.error || 'Payment file creation failed.', 'error');
       }
@@ -573,24 +582,34 @@ const Dashboard = ({ user }) => {
     }
   };
 
-  const submitApReview = async () => {
-    if (!selectedPaymentFile?.bank_file_comparison || selectedPaymentFile.bank_file_matches == null) {
-      showNotification('Upload and compare the bank portal file first.', 'warning');
+  const submitApReview = async (action) => {
+    const rejectedItems = Object.fromEntries(
+      reviewRejectedIds.map((invoiceId) => [invoiceId, (apRejectedComments[invoiceId] || '').trim()])
+    );
+    if (action === 'reject' && reviewRejectedIds.length === 0) {
+      showNotification('Select at least one line item to reject.', 'warning');
       return;
     }
-    const rejectedItems = Object.fromEntries(Object.entries(apRejectedComments).filter(([, comment]) => comment.trim()));
+    if (action === 'reject' && Object.values(rejectedItems).some((comment) => !comment)) {
+      showNotification('Enter a rejection comment for every selected line item.', 'warning');
+      return;
+    }
     setIsSubmittingReview(true);
     try {
       const response = await fetch(`/api/rest/central-payment/${selectedPaymentFile.id}/ap-review/`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rejected_items: rejectedItems }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, rejected_items: action === 'reject' ? rejectedItems : {} }),
       });
       const data = await response.json();
       if (response.ok) {
         setSelectedPaymentFile(data.payment_file);
         setApRejectedComments({});
-        showNotification('AP review submitted.', 'success');
+        setReviewRejectedIds([]);
+        showNotification(action === 'approve' ? 'Payment file approved by AP Team.' : 'AP line-item rejections submitted.', 'success');
         fetchPaymentFiles();
       } else showNotification(data.error || 'Unable to submit AP review.', 'error');
+    } catch (error) {
+      console.error('Error submitting AP review:', error);
+      showNotification('Unable to submit AP review.', 'error');
     } finally {
       setIsSubmittingReview(false);
     }
@@ -1593,31 +1612,43 @@ const Dashboard = ({ user }) => {
               }} style={{ height: '30px', padding: '3px 10px', fontSize: '12px' }}>Clear</button>
             </div>
             <div style={{ overflow: 'auto', flex: '1 1 0', minHeight: 0, width: '100%', border: '1px solid var(--card-border)', borderRadius: '4px', backgroundColor: 'var(--card-background)' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'auto', minWidth: '2800px', fontSize: '12px', lineHeight: '16px' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'auto', minWidth: '1900px', fontSize: '12px', lineHeight: '16px' }}>
                 <thead style={{ position: 'sticky', top: 0, zIndex: 2, backgroundColor: 'var(--background-secondary)' }}>
                   <tr>
-                    {['Status', 'Invoice No', 'Invoice Date', 'Supplier', 'Vendor GST', 'Branch', 'Party Code', 'Voucher Amount', 'Report Goods Value', 'Report Tax Amount', 'Report Tax Code', 'Report Tax Type', 'TDS Amount', 'Due Days', 'Due Date', 'Payment Status', 'Payable', 'Invoice No Match', 'Payable Match', 'Goods Value Match', 'Tax Amount Match', 'Tax Type Match', 'Vendor GST Match', 'Vendor Master', 'Store GST Match', 'Store Master'].map((label) => (
+                    {['Status', 'Invoice No', 'Invoice Date', 'Supplier', 'Vendor GST', 'Branch', 'Party Code', 'Voucher Amount', 'Report Goods Value', 'Report Tax Amount', 'Report Tax Code', 'Report Tax Type', 'TDS Amount', 'Due Days', 'Due Date', 'Payment Status', 'Payable'].map((label) => (
                       <th key={label} style={{ height: '26px', boxSizing: 'border-box', padding: '4px 7px', borderRight: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)', textAlign: 'left', whiteSpace: 'nowrap', fontWeight: 600 }}>{label}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {isDueReportFetching ? (
-                    <tr><td colSpan={26} style={{ padding: '30px', textAlign: 'center' }}>Loading due report…</td></tr>
+                    <tr><td colSpan={17} style={{ padding: '30px', textAlign: 'center' }}>Loading due report…</td></tr>
                   ) : dueReportRows.length === 0 ? (
-                    <tr><td colSpan={26} style={{ padding: '30px', textAlign: 'center', color: 'var(--text-secondary)' }}>No invoices match the selected search and filters.</td></tr>
+                    <tr><td colSpan={17} style={{ padding: '30px', textAlign: 'center', color: 'var(--text-secondary)' }}>No invoices match the selected search and filters.</td></tr>
                   ) : dueReportRows.map((row) => (
                     <tr key={row.id} onClick={() => setSelectedDueReportRow(row)} title="View all invoice details" style={{ height: '24px', cursor: 'pointer' }}>
                       <td style={{ boxSizing: 'border-box', padding: '3px 7px', borderRight: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)', whiteSpace: 'nowrap', fontWeight: 600, color: row.invoice_scanned ? getStatusColor(row.invoice_reconciliation_status).text : 'var(--text-secondary)' }}>{row.invoice_scanned ? formatStatus(row.invoice_reconciliation_status) : 'Not Scanned'}</td>
-                      {[row.invoice_no, row.invoice_date, row.supplier_name, row.gst_number, row.location_name, row.party_code, row.bill_amount, row.goods_value, row.tax_amount, row.tax_code, row.tax_type, row.tds_amount, row.no_of_days, row.due_date, row.payment_status, row.payable].map((value, index) => (
-                        <td key={index} style={{ boxSizing: 'border-box', padding: '3px 7px', borderRight: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)', whiteSpace: 'nowrap' }}>{value ?? '—'}</td>
-                      ))}
-                      {RECONCILIATION_FLAG_FIELDS.map(([fieldName]) => {
-                        const displayValue = renderReconciliationFlag(row, fieldName);
+                      {[
+                        [row.invoice_no, 'invoice_number_matches'],
+                        [row.invoice_date, null],
+                        [row.supplier_name, null],
+                        [row.gst_number, 'vendor_gst_matches'],
+                        [row.location_name, null],
+                        [row.party_code, null],
+                        [row.bill_amount, null],
+                        [row.goods_value, 'goods_value_matches'],
+                        [row.tax_amount, 'tax_amount_matches'],
+                        [row.tax_code, null],
+                        [row.tax_type, 'tax_type_matches'],
+                        [row.tds_amount, null],
+                        [row.no_of_days, null],
+                        [row.due_date, null],
+                        [row.payment_status, null],
+                        [row.payable, 'payable_amount_matches'],
+                      ].map(([value, matchField], index) => {
+                        const isMismatch = row.invoice_scanned && matchField && row[matchField] !== null && row[matchField] !== undefined && !normalizeBooleanFlag(row[matchField]);
                         return (
-                          <td key={fieldName} title={getReconciliationTooltip(row, fieldName)} style={{ boxSizing: 'border-box', padding: '3px 7px', borderRight: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)', textAlign: 'center', fontWeight: 700, color: displayValue === '✓' ? 'var(--success)' : displayValue === '✕' ? 'var(--danger)' : 'var(--text-secondary)' }}>
-                            {displayValue}
-                          </td>
+                          <td key={index} title={isMismatch ? getReconciliationTooltip(row, matchField) : undefined} style={{ boxSizing: 'border-box', padding: '3px 7px', borderRight: '1px solid var(--card-border)', borderBottom: '1px solid var(--card-border)', whiteSpace: 'nowrap', color: isMismatch ? '#d97706' : undefined, fontWeight: isMismatch ? 700 : undefined }}>{value ?? '—'}</td>
                         );
                       })}
                     </tr>
@@ -1762,6 +1793,16 @@ const Dashboard = ({ user }) => {
                             <option value="ICICI">ICICI</option>
                             <option value="SBI">SBI</option>
                         </select>
+                        <label htmlFor="paymentFileFormatSelect" style={{ fontWeight: '600', color: 'var(--text-primary)', marginLeft: '0.5rem' }}>File Format</label>
+                        <select
+                          id="paymentFileFormatSelect"
+                          value={paymentFileFormat}
+                          onChange={(e) => setPaymentFileFormat(e.target.value)}
+                          style={{ padding: '10px 12px', borderRadius: '8px', border: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)' }}
+                        >
+                            <option value="xlsx">Excel (.xlsx)</option>
+                            <option value="csv">CSV (.csv)</option>
+                        </select>
                     </div>
                     <button
                       onClick={toggleSelectAll}
@@ -1857,7 +1898,7 @@ const Dashboard = ({ user }) => {
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', marginTop: '0.25rem' }}>
                                   {paymentFileResult.download_url && (
                                     <a href={paymentFileResult.download_url} target="_blank" rel="noreferrer" style={{ color: 'var(--primary-accent)', fontWeight: '600', display: 'inline-block', padding: '8px 12px', borderRadius: '8px', backgroundColor: 'var(--card-background)', border: '1px solid var(--card-border)' }}>
-                                      Download XLSX file
+                                      Download {paymentFileResult.file_format === 'csv' ? 'CSV' : 'Excel'} file
                                     </a>
                                   )}
                                   {paymentFileResult.id && (
@@ -2014,14 +2055,16 @@ const Dashboard = ({ user }) => {
                                     <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>ID</th>
                                     <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Type</th>
                                     <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Created By</th>
-                                    <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Status</th>
+                                    <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Manager Review</th>
+                                    <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>AP Team Review</th>
                                     <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Created At</th>
                                     <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Action</th>
                                   </tr>
                                 </thead>
                                 <tbody>
                                   {filteredPaymentFiles.map((paymentFile) => {
-                                    const workflowMeta = getPaymentWorkflowMeta(paymentFile.payment_status);
+                                    const managerReviewMeta = getPaymentWorkflowMeta(paymentFile.manager_review_status);
+                                    const apReviewMeta = getPaymentWorkflowMeta(paymentFile.ap_review_status);
                                     return (
                                       <tr
                                         key={paymentFile.id}
@@ -2035,7 +2078,10 @@ const Dashboard = ({ user }) => {
                                         <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>{paymentFile.payment_type}</td>
                                         <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>{paymentFile.created_by || '—'}</td>
                                         <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>
-                                          <span style={{ color: workflowMeta.color, fontWeight: '700' }}>{workflowMeta.label}</span>
+                                          <span style={{ color: managerReviewMeta.color, fontWeight: '700' }}>{managerReviewMeta.label}</span>
+                                        </td>
+                                        <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>
+                                          <span style={{ color: apReviewMeta.color, fontWeight: '700' }}>{apReviewMeta.label}</span>
                                         </td>
                                         <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>{paymentFile.created_at ? new Date(paymentFile.created_at).toLocaleString() : '—'}</td>
                                         <td style={{ padding: '12px', borderBottom: '1px solid var(--card-border)' }}>
@@ -2072,7 +2118,8 @@ const Dashboard = ({ user }) => {
                                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginBottom: '1rem' }}>
                                         <div><div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>ID</div><div style={{ fontWeight: '700' }}>{selectedPaymentFile.id}</div></div>
                                         <div><div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Type</div><div style={{ fontWeight: '700' }}>{selectedPaymentFile.payment_type}</div></div>
-                                        <div><div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Status</div><div style={{ fontWeight: '700', color: getStatusColor(selectedPaymentFile.payment_status).text }}>{selectedPaymentFile.payment_status || 'PENDING'}</div></div>
+                                        <div><div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Manager Review</div><div style={{ fontWeight: '700', color: getStatusColor(selectedPaymentFile.manager_review_status).text }}>{selectedPaymentFile.manager_review_status || 'PENDING'}</div></div>
+                                        <div><div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>AP Review</div><div style={{ fontWeight: '700', color: selectedPaymentFile.is_ap_approved ? 'var(--success)' : selectedPaymentFile.is_ap_rejected ? 'var(--danger)' : 'var(--text-secondary)' }}>{selectedPaymentFile.is_ap_approved ? 'AP Approved' : selectedPaymentFile.is_ap_rejected ? 'AP Rejected' : 'Pending AP Review'}</div></div>
                                         <div><div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Created By</div><div style={{ fontWeight: '700' }}>{selectedPaymentFile.created_by || '—'}</div></div>
                                         <div><div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Rows</div><div style={{ fontWeight: '700' }}>{(selectedPaymentFile.rows || []).length}</div></div>
                                     </div>
@@ -2103,11 +2150,16 @@ const Dashboard = ({ user }) => {
                                         View Generated File
                                       </button>
                                       {selectedPaymentFile.download_url && (
-                                        <a href={selectedPaymentFile.download_url} target="_blank" rel="noreferrer" style={{ padding: '10px 16px', borderRadius: '10px', border: '1px solid var(--card-border)', backgroundColor: 'var(--card-background)', color: 'var(--primary-accent)', fontWeight: '600', textDecoration: 'none' }}>
+                                        <a href={getFormattedDownloadUrl(selectedPaymentFile.download_url, 'xlsx')} target="_blank" rel="noreferrer" style={{ padding: '10px 16px', borderRadius: '10px', border: '1px solid var(--card-border)', backgroundColor: 'var(--card-background)', color: 'var(--primary-accent)', fontWeight: '600', textDecoration: 'none' }}>
                                           Download Excel
                                         </a>
                                       )}
-                                      {role === 'STORE_ACCOUNTANT' && selectedPaymentFile.payment_status === 'REJECTED' && (
+                                      {selectedPaymentFile.download_url && (
+                                        <a href={getFormattedDownloadUrl(selectedPaymentFile.download_url, 'csv')} target="_blank" rel="noreferrer" style={{ padding: '10px 16px', borderRadius: '10px', border: '1px solid var(--card-border)', backgroundColor: 'var(--card-background)', color: 'var(--primary-accent)', fontWeight: '600', textDecoration: 'none' }}>
+                                          Download CSV
+                                        </a>
+                                      )}
+                                      {selectedPaymentFile.can_regenerate && (
                                         <button
                                           type="button"
                                           onClick={regenerateRejectedPaymentFile}
@@ -2153,7 +2205,7 @@ const Dashboard = ({ user }) => {
 
                                     <div style={{ marginBottom: '1.25rem' }}>
                                       <div style={{ fontWeight: '600', color: 'var(--text-primary)', marginBottom: '0.75rem' }}>Invoice Line Items</div>
-                                      {role === 'STORE_ACCOUNTANT' && selectedPaymentFile.payment_status === 'REJECTED' && (
+                                      {selectedPaymentFile.can_regenerate && (
                                         <div style={{ color: 'var(--text-secondary)', fontSize: '0.88rem', marginBottom: '0.75rem' }}>
                                           Approved invoices are selected by default. Rejected invoices are unchecked, but you can include them if needed.
                                         </div>
@@ -2163,11 +2215,14 @@ const Dashboard = ({ user }) => {
                                           <table style={{ width: '100%', minWidth: '860px', borderCollapse: 'collapse' }}>
                                             <thead style={{ backgroundColor: 'var(--background-secondary)', position: 'sticky', top: 0, zIndex: 1 }}>
                                               <tr>
-                                                {role === 'STORE_ACCOUNTANT' && selectedPaymentFile.payment_status === 'REJECTED' && (
+                                                {selectedPaymentFile.can_regenerate && (
                                                   <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Include</th>
                                                 )}
                                                 {role === 'STORE_MANAGER' && !(selectedPaymentFile.payment_status === 'APPROVED' || selectedPaymentFile.payment_status === 'PAID' || selectedPaymentFile.is_payment_file_approved) && (
                                                   <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Reject</th>
+                                                )}
+                                                {role === 'AP_TEAM' && !selectedPaymentFile.is_ap_approved && !selectedPaymentFile.is_ap_rejected && (
+                                                  <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>AP Reject</th>
                                                 )}
                                                 <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Invoice</th>
                                                 <th style={{ padding: '12px', textAlign: 'left', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>GST</th>
@@ -2185,7 +2240,7 @@ const Dashboard = ({ user }) => {
                                                 const isPaymentFileLocked = selectedPaymentFile.payment_status === 'APPROVED' || selectedPaymentFile.payment_status === 'PAID' || selectedPaymentFile.is_payment_file_approved;
                                                 return (
                                                   <tr key={row.id || `${row.invoice_no}-${index}`} style={{ borderBottom: '1px solid var(--card-border)', backgroundColor: isChecked ? 'rgba(255, 77, 79, 0.08)' : (index % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.02)') }}>
-                                                    {role === 'STORE_ACCOUNTANT' && selectedPaymentFile.payment_status === 'REJECTED' && (
+                                                    {selectedPaymentFile.can_regenerate && (
                                                       <td style={{ padding: '12px' }}>
                                                         <input type="checkbox" checked={regenerationInvoiceIds.includes(row.id)} onChange={() => toggleRegenerationInvoice(row.id)} />
                                                       </td>
@@ -2199,19 +2254,29 @@ const Dashboard = ({ user }) => {
                                                         />
                                                       </td>
                                                     )}
+                                                    {role === 'AP_TEAM' && !selectedPaymentFile.is_ap_approved && !selectedPaymentFile.is_ap_rejected && (
+                                                      <td style={{ padding: '12px' }}>
+                                                        <input
+                                                          type="checkbox"
+                                                          checked={isChecked}
+                                                          onChange={() => toggleReviewReject(row.id)}
+                                                          aria-label={`Reject invoice ${row.invoice_no || row.id} by AP Team`}
+                                                        />
+                                                      </td>
+                                                    )}
                                                     <td style={{ padding: '12px' }}>{row.invoice_no || '—'}</td>
                                                     <td style={{ padding: '12px' }}>{row.gst_number || '—'}</td>
                                                     <td style={{ padding: '12px' }}>{row.supplier_name || '—'}</td>
                                                     <td style={{ padding: '12px', textAlign: 'right', fontFamily: 'monospace' }}>{getPaymentFileRowAmountDisplay(row)}</td>
                                                     <td style={{ padding: '12px' }}>
                                                       <span style={{ color: isChecked ? 'var(--danger)' : reviewMeta.color, fontWeight: '700' }}>
-                                                        {isChecked ? 'Marked Rejected' : reviewMeta.label}
+                                                        {row.is_ap_rejected ? 'AP Rejected' : row.is_ap_approved ? 'AP Approved' : isChecked ? 'Marked Rejected' : reviewMeta.label}
                                                       </span>
                                                     </td>
                                                     <td style={{ padding: '12px', color: 'var(--text-secondary)' }}>{row.ap_rejection_reason || row.review_reason || row.manager_rejection_reason || '—'}</td>
                                                     {role === 'AP_TEAM' && (
                                                       <td style={{ padding: '12px' }}>
-                                                        <input type="text" value={apRejectedComments[row.id] || ''} onChange={(event) => setApRejectedComments((current) => ({ ...current, [row.id]: event.target.value }))} placeholder="Enter comment to reject this line" style={{ minWidth: '240px', padding: '8px', borderRadius: '8px', border: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)' }} />
+                                                        <input type="text" disabled={!isChecked || selectedPaymentFile.is_ap_approved || selectedPaymentFile.is_ap_rejected} value={apRejectedComments[row.id] || ''} onChange={(event) => setApRejectedComments((current) => ({ ...current, [row.id]: event.target.value }))} placeholder={isChecked ? 'Required rejection comment' : 'Select AP Reject first'} style={{ minWidth: '240px', padding: '8px', borderRadius: '8px', border: '1px solid var(--card-border)', backgroundColor: 'var(--background-secondary)', color: 'var(--text-primary)', opacity: isChecked ? 1 : 0.6 }} />
                                                       </td>
                                                     )}
                                                   </tr>
@@ -2248,10 +2313,13 @@ const Dashboard = ({ user }) => {
                                         </div>
                                       </div>
                                     )}
-                                    {role === 'AP_TEAM' && selectedPaymentFile.payment_status === 'APPROVED' && (
-                                      <div style={{ borderTop: '1px solid var(--card-border)', paddingTop: '1rem' }}>
-                                        <button onClick={submitApReview} disabled={isSubmittingReview || selectedPaymentFile.bank_file_matches == null} style={{ padding: '10px 16px', borderRadius: '10px', border: 'none', backgroundColor: 'var(--primary-accent)', color: '#fff', cursor: 'pointer', opacity: selectedPaymentFile.bank_file_matches == null ? 0.6 : 1 }}>
-                                          {isSubmittingReview ? 'Submitting...' : 'Submit AP Review'}
+                                    {role === 'AP_TEAM' && selectedPaymentFile.payment_status === 'APPROVED' && !selectedPaymentFile.is_ap_approved && (
+                                      <div style={{ borderTop: '1px solid var(--card-border)', paddingTop: '1rem', display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+                                        <button onClick={() => submitApReview('approve')} disabled={isSubmittingReview} style={{ padding: '10px 16px', borderRadius: '10px', border: 'none', backgroundColor: 'var(--success)', color: '#fff', cursor: 'pointer', opacity: isSubmittingReview ? 0.6 : 1 }}>
+                                          {isSubmittingReview ? 'Submitting...' : 'Approve Payment File'}
+                                        </button>
+                                        <button onClick={() => submitApReview('reject')} disabled={isSubmittingReview} style={{ padding: '10px 16px', borderRadius: '10px', border: 'none', backgroundColor: 'var(--danger)', color: '#fff', cursor: 'pointer', opacity: isSubmittingReview ? 0.6 : 1 }}>
+                                          {isSubmittingReview ? 'Submitting...' : 'Submit AP Rejections'}
                                         </button>
                                       </div>
                                     )}
@@ -2599,8 +2667,13 @@ const Dashboard = ({ user }) => {
                   <>
                     <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
                       {previewPaymentFile.download_url && (
-                        <a href={previewPaymentFile.download_url} target="_blank" rel="noreferrer" style={{ color: 'var(--primary-accent)', fontWeight: '600', display: 'inline-block', padding: '10px 16px', borderRadius: '10px', backgroundColor: 'var(--background-secondary)', border: '1px solid var(--card-border)' }}>
+                        <a href={getFormattedDownloadUrl(previewPaymentFile.download_url, 'xlsx')} target="_blank" rel="noreferrer" style={{ color: 'var(--primary-accent)', fontWeight: '600', display: 'inline-block', padding: '10px 16px', borderRadius: '10px', backgroundColor: 'var(--background-secondary)', border: '1px solid var(--card-border)' }}>
                           Download Excel
+                        </a>
+                      )}
+                      {previewPaymentFile.download_url && (
+                        <a href={getFormattedDownloadUrl(previewPaymentFile.download_url, 'csv')} target="_blank" rel="noreferrer" style={{ color: 'var(--primary-accent)', fontWeight: '600', display: 'inline-block', padding: '10px 16px', borderRadius: '10px', backgroundColor: 'var(--background-secondary)', border: '1px solid var(--card-border)' }}>
+                          Download CSV
                         </a>
                       )}
                     </div>
@@ -2609,8 +2682,6 @@ const Dashboard = ({ user }) => {
                         const isICICI = previewPaymentFile.payment_type === 'ICICI';
                         const today = new Date();
                         const dateStr = `${String(today.getDate()).padStart(2,'0')}-${String(today.getMonth()+1).padStart(2,'0')}-${today.getFullYear()}`;
-                        const pvRef = previewPaymentFile.unique_id || previewPaymentFile.id || '';
-
                         const cols = isICICI ? [
                           { label: 'PYMT_PROD_TYPE_CODE', get: () => 'PAB_VENDOR' },
                           { label: 'PYMT_MODE',           get: () => 'NEFT' },
@@ -2623,9 +2694,9 @@ const Dashboard = ({ user }) => {
                           { label: 'CREDIT_NARR',         get: () => '' },
                           { label: 'MOBILE_NUM',          get: row => row.phone || '—' },
                           { label: 'EMAIL_ID',            get: row => row.email || '—' },
-                          { label: 'REMARK',              get: () => pvRef },
+                          { label: 'REMARK',              get: row => row.remarks || '' },
                           { label: 'PYMT_DATE',           get: () => dateStr },
-                          { label: 'REF_NO',              get: () => '' },
+                          { label: 'REF_NO',              get: row => row.payment_reference_number || '' },
                           { label: 'ADDL_INFO1',          get: row => row.gst_number || '—' },
                           { label: 'ADDL_INFO2',          get: () => '' },
                           { label: 'ADDL_INFO3',          get: () => '' },
@@ -2641,7 +2712,7 @@ const Dashboard = ({ user }) => {
                           { label: 'BEN.ACCOU',                       get: row => row.account_number || '—' },
                           { label: 'IFSC CODE',                       get: row => row.ifsc_code || '—' },
                           { label: 'PAYMENT INSTRCUCTION',            get: () => 'VENDOR PAYMENT' },
-                          { label: 'COR.REF NO (UNIQUE) PV NUMBER',   get: () => pvRef },
+                          { label: 'COR.REF NO (UNIQUE) PV NUMBER',   get: row => row.payment_reference_number || '' },
                           { label: 'PAYABLE CURRENCY',                get: () => 'INR' },
                           { label: 'BENEFICIARY ADDRESS',             get: row => row.address || '—' },
                           { label: 'EMAIL',                           get: row => row.email || '—' },

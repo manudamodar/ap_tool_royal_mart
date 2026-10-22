@@ -2,7 +2,7 @@ from django.conf import settings
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from .tasks import sync_bills_from_gofrugal
+from .tasks import sync_due_reports_task
 
 
 @csrf_exempt
@@ -23,12 +23,10 @@ def sync_bills(request):
             "error": "finYear query parameter is required (for example: 2026_2027).",
         }, status=400)
 
-    result = sync_bills_from_gofrugal(fin_year=fin_year)
-    if result is None:
-        return JsonResponse({
-            "status": "error",
-            "message": "Unable to fetch valid bill data from GoFrugal.",
-        }, status=502)
-
-    response_data, _ = result
-    return JsonResponse(response_data, safe=isinstance(response_data, dict))
+    task = sync_due_reports_task.delay(fin_year=fin_year)
+    return JsonResponse({
+        "status": "accepted",
+        "message": "Due-report synchronization was queued in the background.",
+        "task_id": task.id,
+        "fin_year": fin_year,
+    }, status=202)

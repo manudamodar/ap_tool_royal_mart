@@ -379,6 +379,7 @@ def build_payment_file_rows(payment_type, invoice_rows, overrides=None):
             'bnf_name': f"{name}  {gst}".strip() if gst else name,
             'amount': amount.quantize(Decimal('0.01')) if isinstance(amount, Decimal) else _coerce_decimal(amount),
             'remarks': row_override.get('remarks', f"Invoice {row.invoice_no} / {gst or 'GST N/A'}"),
+            'payment_reference_number': row.payment_reference_number or '',
         })
 
     return rows
@@ -389,6 +390,15 @@ def _build_row_values(payment_type, invoice_row, debit_account, payment_ref, dat
     r = invoice_row
     amount_str = f"{float(r.get('amount') or 0):,.2f}"
     amount_num = float(r.get('amount') or 0)
+    reference_number = str(r.get('payment_reference_number') or payment_ref or '').strip()
+
+    logger.info(
+        'Rendering %s payment row: invoice_id=%s invoice_no=%s reference_number=%s',
+        payment_type,
+        r.get('id'),
+        r.get('invoice_no'),
+        reference_number,
+    )
 
     if payment_type == 'SBI':
         return [
@@ -401,7 +411,7 @@ def _build_row_values(payment_type, invoice_row, debit_account, payment_ref, dat
             r.get('account_number') or '',             # BEN.ACCOU
             r.get('ifsc_code') or '',                  # IFSC CODE
             'VENDOR PAYMENT',                          # PAYMENT INSTRCUCTION
-            payment_ref,                               # COR.REF NO (UNIQUE) PV NUMBER
+            reference_number,                         # COR.REF NO (UNIQUE) PV NUMBER
             'INR',                                     # PAYABLE CURRENCY
             r.get('address') or '',                    # BENEFICIARY ADDRESS
             r.get('email') or '',                      # EMAIL
@@ -420,9 +430,9 @@ def _build_row_values(payment_type, invoice_row, debit_account, payment_ref, dat
             '',                                        # CREDIT_NARR
             r.get('phone') or '',                      # MOBILE_NUM
             r.get('email') or '',                      # EMAIL_ID
-            payment_ref,                               # REMARK
+            r.get('remarks') or '',                    # REMARK
             date_str,                                  # PYMT_DATE
-            '',                                        # REF_NO
+            reference_number,                         # REF_NO
             r.get('gst_number') or '',                 # ADDL_INFO1
             '',                                        # ADDL_INFO2
             '',                                        # ADDL_INFO3

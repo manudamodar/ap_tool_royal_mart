@@ -418,6 +418,79 @@ class PaymentFileTests(TestCase):
         self.assertEqual(payment_file.rejected_due_report_row_ids, [invoice_row2.id])
         self.assertEqual(payment_file.line_item_overrides.get(str(invoice_row1.id))['remarks'], 'Approved with correction')
 
+    def test_ap_team_can_approve_payment_file_and_invoice_links(self):
+        ap_user = User.objects.create_user(username='ap-approval-user')
+        accountant = User.objects.create_user(username='ap-approval-accountant')
+        UserProfile.objects.create(user=ap_user, role='AP_TEAM')
+        due_report = DueReportUpload.objects.create(
+            original_filename='ap_approval_due_report.xlsx', uploaded_by=accountant, row_count=1,
+        )
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report, uploaded_by=accountant, invoice_no='AP-INV-1',
+        )
+        payment_file = create_payment_file_record('ICICI', [invoice_row], accountant)
+        link = payment_file.invoice_links.get()
+        link.status = PaymentFileInvoice.Status.MANAGER_APPROVED
+        link.save(update_fields=['status'])
+        payment_file.bank_portal_file.save('bank.csv', ContentFile(b'header\n'), save=True)
+
+        self.client.force_login(ap_user)
+        response = self.client.post(
+            f'/api/rest/central-payment/{payment_file.id}/ap-review/',
+            data=json.dumps({'action': 'approve', 'rejected_items': {}}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payment_file.refresh_from_db()
+        link.refresh_from_db()
+        self.assertTrue(payment_file.is_ap_approved)
+        self.assertFalse(payment_file.is_ap_rejected)
+        self.assertTrue(link.is_ap_approved)
+        self.assertFalse(link.is_ap_rejected)
+        self.assertEqual(link.status, PaymentFileInvoice.Status.AP_APPROVED)
+
+    def test_ap_team_rejection_sets_file_and_line_item_flags(self):
+        ap_user = User.objects.create_user(username='ap-rejection-user')
+        accountant = User.objects.create_user(username='ap-rejection-accountant')
+        UserProfile.objects.create(user=ap_user, role='AP_TEAM')
+        due_report = DueReportUpload.objects.create(
+            original_filename='ap_rejection_due_report.xlsx', uploaded_by=accountant, row_count=1,
+        )
+        invoice_row = DueReportInvoiceWise.objects.create(
+            due_report=due_report, uploaded_by=accountant, invoice_no='AP-INV-2',
+        )
+        payment_file = create_payment_file_record('ICICI', [invoice_row], accountant)
+        link = payment_file.invoice_links.get()
+        link.status = PaymentFileInvoice.Status.MANAGER_APPROVED
+        link.save(update_fields=['status'])
+        payment_file.bank_portal_file.save('bank.csv', ContentFile(b'header\n'), save=True)
+
+        self.client.force_login(ap_user)
+        response = self.client.post(
+            f'/api/rest/central-payment/{payment_file.id}/ap-review/',
+            data=json.dumps({'action': 'reject', 'rejected_items': {str(invoice_row.id): 'Incorrect bank data'}}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payment_file.refresh_from_db()
+        link.refresh_from_db()
+        self.assertFalse(payment_file.is_ap_approved)
+        self.assertTrue(payment_file.is_ap_rejected)
+        self.assertFalse(link.is_ap_approved)
+        self.assertTrue(link.is_ap_rejected)
+        self.assertEqual(link.status, PaymentFileInvoice.Status.AP_REJECTED)
+        self.assertTrue(response.json()['payment_file']['can_regenerate'])
+
+        regenerate_response = self.client.post(
+            f'/api/rest/central-payment/{payment_file.id}/regenerate/',
+            data=json.dumps({'invoice_ids': [invoice_row.id]}),
+            content_type='application/json',
+        )
+        self.assertEqual(regenerate_response.status_code, 201)
+        self.assertEqual(regenerate_response.json()['payment_file']['source_payment_file_id'], payment_file.id)
+
     def test_create_payment_file_record_preserves_rejected_state_for_reselected_rows(self):
         accountant = User.objects.create_user(username='accountant-user-preserve')
         due_report = DueReportUpload.objects.create(
@@ -448,11 +521,11 @@ class PaymentFileTests(TestCase):
         self.assertTrue(invoice_row.manager_rejected)
         self.assertTrue(invoice_row.is_payment_file_created)
 
-    def test_store_accountant_can_regenerate_payment_file_excluding_rejected_rows(self):
+    def test_only_rejecting_manager_can_regenerate_payment_file(self):
         manager = User.objects.create_user(username='manager-user2')
         accountant = User.objects.create_user(username='accountant-user2')
         UserProfile.objects.create(user=manager, role='STORE_MANAGER')
-        UserProfile.objects.create(user=accountant, role='STORE_ACCOUNTANT')
+        UserProfile.objects.create(user=accountant, role='STORE_ACCOUNTANT', account_manager=manager)
 
         due_report = DueReportUpload.objects.create(
             original_filename='payment_due_report2.xlsx',
@@ -484,32 +557,42 @@ class PaymentFileTests(TestCase):
             manager_rejected_by=manager,
         )
 
-        payment_file = PaymentFile.objects.create(
-            due_report=due_report,
+        payment_file = create_payment_file_record(
             payment_type='ICICI',
-            status='COMPLETED',
-            total_files=2,
-            processed_files=2,
+            invoice_rows=[invoice_row1, invoice_row2],
             created_by=accountant,
-            modified_by=accountant,
-            rejected_due_report_row_ids=[invoice_row2.id],
         )
-        payment_file.due_report_rows.add(invoice_row1, invoice_row2)
+
+        self.client.force_login(manager)
+        review_response = self.client.post(
+            f'/api/rest/central-payment/{payment_file.id}/review/',
+            data=json.dumps({'rejected_ids': [invoice_row2.id], 'edits': {}}),
+            content_type='application/json',
+        )
+        self.assertEqual(review_response.status_code, 200)
+        self.assertTrue(review_response.json()['payment_file']['can_regenerate'])
 
         self.client.force_login(accountant)
+        forbidden_response = self.client.post(
+            f'/api/rest/central-payment/{payment_file.id}/regenerate/',
+            data=json.dumps({'invoice_ids': [invoice_row1.id]}),
+            content_type='application/json',
+        )
+        self.assertEqual(forbidden_response.status_code, 403)
+
+        self.client.force_login(manager)
         response = self.client.post(
             f'/api/rest/central-payment/{payment_file.id}/regenerate/',
-            data=json.dumps({}),
-            content_type='application/json'
+            data=json.dumps({'invoice_ids': [invoice_row1.id]}),
+            content_type='application/json',
         )
-
         self.assertEqual(response.status_code, 201)
         data = response.json()
         self.assertEqual(data['payment_file']['total_files'], 1)
         self.assertEqual(len(data['payment_file']['rows']), 1)
         self.assertTrue(any(row['id'] == invoice_row1.id for row in data['payment_file']['rows']))
         self.assertFalse(any(row['id'] == invoice_row2.id for row in data['payment_file']['rows']))
-        self.assertEqual(data['payment_file']['rejected_due_report_row_ids'], [invoice_row2.id])
+        self.assertEqual(data['payment_file']['source_payment_file_id'], payment_file.id)
 
     def test_store_manager_can_see_files_created_by_managed_accountant(self):
         manager = User.objects.create_user(username='manager-user3')
@@ -831,6 +914,13 @@ class PaymentFileTests(TestCase):
         self.assertEqual(response['Content-Type'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         self.assertIn('attachment; filename=', response['Content-Disposition'])
         self.assertTrue(response.content.startswith(b'PK'))
+
+        csv_response = self.client.get(f'/api/rest/central-payment/download/{payment_file.id}/?format=csv')
+
+        self.assertEqual(csv_response.status_code, 200)
+        self.assertEqual(csv_response['Content-Type'], 'text/csv; charset=utf-8')
+        self.assertIn('.csv', csv_response['Content-Disposition'])
+        self.assertIn(b'PYMT_PROD_TYPE_CODE', csv_response.content)
 
 
 class CashDiscountLookupTests(TestCase):

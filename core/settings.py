@@ -115,7 +115,7 @@ MSAL_CLIENT_SECRET = os.environ.get("MSAL_CLIENT_SECRET", "dummy_client_secret")
 # Use the common endpoint by default if no tenant ID is specified
 MSAL_TENANT_ID = os.environ.get("MSAL_TENANT_ID", "common")
 MSAL_AUTHORITY = f"https://login.microsoftonline.com/{MSAL_TENANT_ID}"
-MSAL_REDIRECT_URI = "https://discounted-responsible-flame-software.trycloudflare.com/api/auth/callback/"
+MSAL_REDIRECT_URI = "http://localhost:8000/api/auth/callback"
 MSAL_SCOPES = ["User.ReadBasic.All"]
 
 # Store's own bank account numbers used as DEBIT_ACC_NO in payment files.
@@ -145,6 +145,17 @@ EXTERNAL_GETBILLS_TOKEN = os.environ.get('EXTERNAL_GETBILLS_TOKEN', '').strip()
 EXTERNAL_GETBILLS_CONNECT_TIMEOUT_SECONDS = int(os.environ.get('EXTERNAL_GETBILLS_CONNECT_TIMEOUT_SECONDS', '15'))
 EXTERNAL_GETBILLS_READ_TIMEOUT_SECONDS = int(os.environ.get('EXTERNAL_GETBILLS_READ_TIMEOUT_SECONDS', '600'))
 
+# TrueBooks payable acknowledgement and central-payment APIs. If the endpoint
+# URLs are omitted, they are built from EXTERNAL_TRUEBOOKS_BASE_URL (or from the
+# host portion of EXTERNAL_GETBILLS_URL).
+EXTERNAL_TRUEBOOKS_BASE_URL = os.environ.get('EXTERNAL_TRUEBOOKS_BASE_URL', '').strip()
+EXTERNAL_TRUEBOOKS_APPROVEBILLS_URL = os.environ.get('EXTERNAL_TRUEBOOKS_APPROVEBILLS_URL', '').strip()
+EXTERNAL_TRUEBOOKS_CENTRAL_PAYMENT_URL = os.environ.get('EXTERNAL_TRUEBOOKS_CENTRAL_PAYMENT_URL', '').strip()
+TRUEBOOKS_PAYMENT_BANK_NAME = os.environ.get('TRUEBOOKS_PAYMENT_BANK_NAME', '').strip()
+TRUEBOOKS_PAYMENT_BANK_CODE = os.environ.get('TRUEBOOKS_PAYMENT_BANK_CODE', '').strip()
+TRUEBOOKS_PAYMENT_MODE = os.environ.get('TRUEBOOKS_PAYMENT_MODE', 'C').strip()
+TRUEBOOKS_PAYMENT_CHEQUE_NO = os.environ.get('TRUEBOOKS_PAYMENT_CHEQUE_NO', '').strip()
+
 # Celery Configuration
 CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')
 CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
@@ -152,3 +163,13 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
+
+# Celery Beat reads the synchronization frequency from the environment. The
+# financial year is calculated by the task using the current date.
+DUE_REPORT_SYNC_INTERVAL_SECONDS = int(os.environ.get('DUE_REPORT_SYNC_INTERVAL_SECONDS', '3600'))
+CELERY_BEAT_SCHEDULE = {
+    'sync-due-reports': {
+        'task': 'ap_app.tasks.sync_due_reports_task',
+        'schedule': DUE_REPORT_SYNC_INTERVAL_SECONDS,
+    },
+}
