@@ -19,6 +19,7 @@ from .models import (
     BatchStatus,
     ReconciliationStatus,
     DueReportInvoiceWise,
+    RoyalMartStoreMaster,
     VendorMaster,
 )
 from .due_report_service import extract_gst_from_supplier_name
@@ -36,6 +37,74 @@ def _normalize_whitespace(value):
         return None
     normalized = re.sub(r"\s+", " ", str(value)).strip(" :.-")
     return normalized or None
+
+
+INVOICE_TITLE_VALUES = {
+    'CASH BILL', 'CASH/CREDIT BILL', 'CREDIT BILL', 'ESTIMATE',
+    'TAX INVOICE', 'INVOICE', 'BILL',
+}
+
+
+def _extract_invoice_number(extracted_text, llm_value=None, filename=None):
+    """Resolve an invoice number without confusing document titles for it."""
+    text = extracted_text or ''
+
+    # Strongest evidence: a dedicated labelled line such as `No. 5689` or
+    # `Invoice No: INV-2461`. Anchoring to a full line avoids `Sy. No. 42/1`,
+    # serial-number columns and address numbers.
+    labelled_patterns = (
+        r'(?im)^\s*(?:invoice\s*(?:no\.?|number)|inv\.?\s*no\.?)\s*[:#.-]*\s*([A-Z0-9][A-Z0-9./-]{1,})\s*$',
+        r'(?im)^\s*no\.?\s*[:#.-]*\s*([A-Z0-9][A-Z0-9./-]{1,})\s*$',
+    )
+    for pattern in labelled_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return _normalize_whitespace(match.group(1))
+
+    # Some POS invoices have a scrambled OCR reading order around `Bill No`,
+    # `Bill Date`, user/counter code and invoice number. A full structured bill
+    # token such as 26/3412/0000736 is stronger evidence than a nearby code
+    # such as RPHMNGR1 or the shortened number in the uploaded filename.
+    structured_invoice = re.search(r'(?<![A-Z0-9])([0-9]{2}/[0-9]{4}/[0-9]{4,})(?![A-Z0-9])', text, flags=re.IGNORECASE)
+    if structured_invoice:
+        return _normalize_whitespace(structured_invoice.group(1))
+
+    filename_stem = os.path.splitext(os.path.basename(filename or ''))[0]
+    filename_match = re.search(
+        r'(?i)\b(?:invoice|inv)(?:\s+no\.?)?[\s_:#-]+([A-Z0-9][A-Z0-9./-]{1,})',
+        filename_stem,
+    )
+    if filename_match:
+        return _normalize_whitespace(filename_match.group(1))
+
+    leading_filename_number = re.match(
+        r'^\s*([0-9][A-Z0-9./-]{2,})\b',
+        filename_stem,
+        flags=re.IGNORECASE,
+    )
+    if leading_filename_number:
+        filename_number = leading_filename_number.group(1)
+        # Handwritten forms may not print a machine-readable `Bill No.` label,
+        # but Azure can still recognize the number elsewhere on the page. The
+        # same standalone value in both filename and OCR text is stronger than
+        # an LLM-selected date or customer code.
+        if re.search(
+            rf'(?<![A-Z0-9]){re.escape(filename_number)}(?![A-Z0-9])',
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return _normalize_whitespace(filename_number)
+
+    normalized_llm_value = _normalize_whitespace(llm_value)
+    llm_is_title = (
+        not normalized_llm_value
+        or normalized_llm_value.upper() in INVOICE_TITLE_VALUES
+    )
+    if llm_is_title:
+        if leading_filename_number:
+            return _normalize_whitespace(leading_filename_number.group(1))
+
+    return normalized_llm_value
 
 
 def _find_labeled_value(text, patterns):
@@ -205,6 +274,73 @@ def _clean_vendor_name(value):
     return cleaned or None
 
 
+def _recover_store_gst(extracted_text, current_gst=None):
+    """Recover one-character OCR errors only against a unique active store GST."""
+    if current_gst and GSTIN_REGEX.fullmatch(str(current_gst).strip()):
+        return str(current_gst).strip().upper()
+
+    raw_candidates = {
+        value.upper()
+        for value in re.findall(r"\b[0-9A-Z]{15}\b", extracted_text or "", flags=re.IGNORECASE)
+    }
+    store_gsts = {
+        value.upper()
+        for value in RoyalMartStoreMaster.objects.filter(is_active=True)
+        .values_list('gst_number', flat=True)
+        if value
+    }
+    matches = {
+        store_gst
+        for candidate in raw_candidates
+        for store_gst in store_gsts
+        if len(candidate) == len(store_gst) == 15
+        and sum(left != right for left, right in zip(candidate, store_gst)) <= 1
+    }
+    return next(iter(matches)) if len(matches) == 1 else current_gst
+
+
+def _recover_vendor_gst(extracted_text, current_gst=None):
+    """Recover one-character OCR errors only against a unique active vendor GST."""
+    if current_gst and GSTIN_REGEX.fullmatch(str(current_gst).strip()):
+        return str(current_gst).strip().upper()
+
+    raw_candidates = {
+        value.upper()
+        for value in re.findall(r"\b[0-9A-Z]{15}\b", extracted_text or "", flags=re.IGNORECASE)
+    }
+    store_gsts = {
+        value.upper()
+        for value in RoyalMartStoreMaster.objects.filter(is_active=True)
+        .values_list('gst_number', flat=True)
+        if value
+    }
+    # The same invoice also contains the buyer GST. Remove candidates that are
+    # exact or one-character OCR variants of a configured Royal Mart store.
+    raw_candidates = {
+        candidate
+        for candidate in raw_candidates
+        if not any(
+            len(candidate) == len(store_gst) == 15
+            and sum(left != right for left, right in zip(candidate, store_gst)) <= 1
+            for store_gst in store_gsts
+        )
+    }
+    vendor_gsts = {
+        value.upper()
+        for value in VendorMaster.objects.filter(is_active=True)
+        .values_list('gst_number', flat=True)
+        if value
+    }
+    matches = {
+        vendor_gst
+        for candidate in raw_candidates
+        for vendor_gst in vendor_gsts
+        if len(candidate) == len(vendor_gst) == 15
+        and sum(left != right for left, right in zip(candidate, vendor_gst)) <= 1
+    }
+    return next(iter(matches)) if len(matches) == 1 else current_gst
+
+
 def _extract_vendor_name_from_header(text):
     """Find the seller heading that Azure sometimes returns only partially."""
     if not text:
@@ -365,9 +501,11 @@ def enrich_invoice_fields(extracted_data, extracted_text, key_value_pairs=None):
     enriched_data = dict(extracted_data or {})
     text = extracted_text or ""
 
-    enriched_data.update(_extract_vendor_bank_details(key_value_pairs))
-    enriched_data["hsn_or_sac"] = _extract_hsn_or_sac(text)
-    enriched_data["vendor_gst_number"] = _extract_gst_number(text, [
+    for key, value in _extract_vendor_bank_details(key_value_pairs).items():
+        if value and not enriched_data.get(key):
+            enriched_data[key] = value
+    enriched_data["hsn_or_sac"] = enriched_data.get("hsn_or_sac") or _extract_hsn_or_sac(text)
+    extracted_vendor_gst = _extract_gst_number(text, [
         r"\bvendor\b",
         r"\bsupplier\b",
         r"\bseller\b",
@@ -376,7 +514,7 @@ def enrich_invoice_fields(extracted_data, extracted_text, key_value_pairs=None):
         r"\bvendor gst\b",
         r"\bsupplier gst\b",
     ])
-    enriched_data["customer_gst_number"] = _extract_gst_number(text, [
+    extracted_customer_gst = _extract_gst_number(text, [
         r"\bcustomer\b",
         r"\bbuyer\b",
         r"\brecipient\b",
@@ -386,6 +524,8 @@ def enrich_invoice_fields(extracted_data, extracted_text, key_value_pairs=None):
         r"\bto\b",
         r"\broyal mart\b",
     ])
+    enriched_data["vendor_gst_number"] = enriched_data.get("vendor_gst_number") or extracted_vendor_gst
+    enriched_data["customer_gst_number"] = enriched_data.get("customer_gst_number") or extracted_customer_gst
 
     if not enriched_data.get("vendor_gst_number"):
         gst_matches = [match.group(0).upper() for match in GSTIN_REGEX.finditer(text)]
@@ -469,99 +609,297 @@ def get_next_azure_credential():
 
 def extract_data_from_image(file_path, endpoint, key):
     """
-    Extracts invoice data using Azure Document Intelligence (Form Recognizer).
+    Extract invoice text with Azure Computer Vision and invoice fields with OpenAI.
     """
     try:
-        document_analysis_client = DocumentAnalysisClient(
-            endpoint=endpoint, credential=AzureKeyCredential(key)
-        )
+        # Keep imports local so workers that do not run OCR can still import tasks.
+        from langchain_core.messages import HumanMessage
+        from langchain_openai import ChatOpenAI
 
-        with open(file_path, "rb") as f:
-            poller = document_analysis_client.begin_analyze_document(
-                "prebuilt-invoice",
-                document=f,
-                features=[AnalysisFeature.KEY_VALUE_PAIRS],
-            )
-        result = poller.result()
+        ocr_max_retries = 5
+        for attempt in range(ocr_max_retries):
+            try:
+                doc_client = DocumentAnalysisClient(
+                    endpoint=endpoint,
+                    credential=AzureKeyCredential(key),
+                )
+                with open(file_path, "rb") as file_handle:
+                    poller = doc_client.begin_analyze_document(
+                        "prebuilt-read",
+                        document=file_handle,
+                    )
+                ocr_result = poller.result()
+                extracted_text = (ocr_result.content or "").strip()
+                if not extracted_text:
+                    raise ValueError("No text extracted from document")
+                break
+            except Exception:
+                if attempt == ocr_max_retries - 1:
+                    raise
+                wait_time = 2 ** attempt
+                logger.warning(
+                    "Azure OCR attempt %s/%s failed for %s; retrying in %s seconds",
+                    attempt + 1, ocr_max_retries, file_path, wait_time, exc_info=True,
+                )
+                time.sleep(wait_time)
 
-        extracted_data = {}
-        extracted_text = result.content
-
-        # Assume we are processing the first invoice in the document
-        if result.documents:
-            invoice = result.documents[0]
-            fields = invoice.fields
-
-            extracted_data["invoice_number"] = fields.get("InvoiceId").value if fields.get("InvoiceId") else None
-            extracted_data["vendor_name"] = fields.get("VendorName").value if fields.get("VendorName") else None
-            
-            # --- PRIORITY AMOUNT EXTRACTION LOGIC ---
-            # 1. Try to get "AmountDue" (Net Payable) first
-            if fields.get("AmountDue"):
-                val = fields.get("AmountDue").value
-                extracted_data["total_amount"] = val.amount if hasattr(val, 'amount') else val
-            # 2. Fallback to "InvoiceTotal" if AmountDue is missing
-            elif fields.get("InvoiceTotal"):
-                val = fields.get("InvoiceTotal").value
-                extracted_data["total_amount"] = val.amount if hasattr(val, 'amount') else val
-            else:
-                extracted_data["total_amount"] = None
-
-            if fields.get("SubTotal"):
-                val = fields.get("SubTotal").value
-                extracted_data["goods_value"] = val.amount if hasattr(val, 'amount') else val
-            else:
-                extracted_data["goods_value"] = None
-
-            if fields.get("TotalTax"):
-                val = fields.get("TotalTax").value
-                extracted_data["tax_amount"] = val.amount if hasattr(val, 'amount') else val
-            else:
-                extracted_data["tax_amount"] = None
                 
-            extracted_data["date"] = fields.get("InvoiceDate").value.isoformat() if fields.get("InvoiceDate") and fields.get("InvoiceDate").value else None
+        def configured_openai_value(name, default=None):
+            return os.environ.get(name) or getattr(settings, name, None) or default
 
-        # Extract Tables
-        tables_data = []
-        for table_idx, table in enumerate(result.tables):
-            table_dict = {
-                "table_id": table_idx,
-                "row_count": table.row_count,
-                "column_count": table.column_count,
-                "cells": []
-            }
-            for cell in table.cells:
-                table_dict["cells"].append({
-                    "row_index": cell.row_index,
-                    "column_index": cell.column_index,
-                    "content": cell.content
-                })
-            tables_data.append(table_dict)
+        openai_api_key = configured_openai_value("OPENAI_API_KEY")
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY is not configured")
+        model_name = configured_openai_value("OPENAI_MODEL", "gpt-4o-mini")
 
-        if tables_data:
-            extracted_data["tables"] = tables_data
+        prompt = """
+You are an expert invoice data extraction specialist. Your task is to carefully analyze the provided invoice text and extract ALL information with high precision.
 
-        calculated_goods_value = _extract_amount_below_table_header(
-            tables_data,
-            [r"taxable\s+value", r"taxable\s+amt(?:ount)?"],
+CRITICAL INSTRUCTIONS:
+1. TAKE YOUR TIME - Think step by step and be thorough
+2. EXTRACT ALL DATA EXACTLY as it appears - do not calculate unless explicitly needed
+3. IDENTIFY PARTIES CORRECTLY:
+   - Sender/Supplier = The company issuing the invoice (usually has company letterhead, "From" section, or supplier details)
+   - Receiver/Client = The company being billed (usually has "Bill To", "Ship To", or client details)
+4. HANDLE NUMBERS PROPERLY:
+   - Remove all commas, currency symbols, and extra spaces from numeric values
+   - Return only numeric values (e.g., "1,23,456.78" becomes "123456.78")
+5. CALCULATE WHEN NECESSARY:
+   - If item-level tax amounts are not directly available, calculate them using: (Item Amount × Tax Rate) / 100
+   - If total amounts are missing, calculate as: Base Amount + All Taxes
+   - Never copy or distribute an invoice-level grand total into item-level fields
+6. DATE FORMATTING: Convert all dates to DD/MM/YYYY format
+7. EXTRACT EVERY ITEM: Don't stop at the first item - extract all line items from the invoice
+8. TAX HANDLING:
+   - Look for tax amounts in separate sections if not per-item
+   - Do not apply or distribute invoice-level taxes to items when individual item tax is not printed
+   - Calculate missing tax amounts using rates when available
+
+STEP-BY-STEP PROCESS:
+1. First, identify the invoice structure and parties
+2. Extract basic invoice information (number, date, etc.)
+3. Identify all line items with their details
+4. Calculate any missing amounts using available data
+5. Ensure all numeric values are clean (no commas, symbols)
+6. Verify calculations make sense
+
+REQUIRED JSON OUTPUT FORMAT:
+{
+  "sender": {
+    "name": "Company name issuing the invoice",
+    "address": "Complete sender address",
+    "gstin": "Sender's GSTIN if available"
+  },
+  "receiver": {
+    "name": "Company being billed",
+    "address": "Complete receiver address",
+    "gstin": "Receiver's GSTIN if available"
+  },
+  "invoice_number": "Invoice number",
+  "date": "Invoice date in DD/MM/YYYY format",
+  "currency": "Currency used (INR, USD, etc.)",
+  "taxable_value": "Invoice-level taxable value/subtotal before tax and after discount",
+  "subtotal": "Invoice-level subtotal before tax",
+  "discount": "Invoice-level discount amount",
+  "total_cgst": "Invoice-level total CGST",
+  "total_sgst": "Invoice-level total SGST",
+  "total_igst": "Invoice-level total IGST",
+  "total_tax": "Invoice-level total tax",
+  "other_charges": "Invoice-level charges added after taxable value, excluding tax",
+  "round_off": "Invoice-level round-off amount, including its sign",
+  "invoice_total": "Final invoice/grand total",
+  "amount_due": "Final net amount payable",
+  "bank_name": "Bank name if mentioned",
+  "account_number": "Account number if mentioned",
+  "ifsc_code": "IFSC code if mentioned",
+  "items": [
+    {
+      "particulars": "Item/Service description",
+      "hsn_sac": "HSN or SAC code",
+      "quantity": "Quantity as number only",
+      "unit_price": "Unit price as number only",
+      "total_amount": "Item total before tax as number only",
+      "cgst_rate": "CGST rate as number only (e.g., 9)",
+      "cgst_amount": "CGST amount as number only",
+      "sgst_rate": "SGST rate as number only (e.g., 9)",
+      "sgst_amount": "SGST amount as number only",
+      "igst_rate": "IGST rate as number only (e.g., 18)",
+      "igst_amount": "IGST amount as number only",
+      "amount_after_tax": "Final amount including all taxes as number only"
+    }
+  ]
+}
+
+IMPORTANT REMINDERS:
+- CASH BILL, ESTIMATE, TAX INVOICE and similar headings are document types, never invoice numbers
+- Extract the value printed beside Invoice No., Inv No. or No.; for example `No. 5689` means invoice_number is `5689`
+- Do not use user, manager, counter or terminal codes such as RPHMNGR1 as the invoice number; prefer the full structured bill number such as `26/3412/0000736`
+- Invoice-level totals must be copied from the invoice summary/total section and must not be derived from or distributed across line items when printed totals are available
+- Keep invoice-level totals separate from item-level amounts
+- Extract ALL items, not just the first one
+- Calculate missing values when possible using available data
+- Clean all numeric values (remove commas, symbols)
+- Think through the invoice structure before extracting
+- Keep invoice-level tax only in the invoice-level total tax fields
+- Double-check your calculations
+- Be thorough and precise
+
+Now analyze this invoice text:
+
+"""
+
+        def validated_json(response_text):
+            cleaned = re.sub(r"```(?:json)?\s*", "", response_text.strip(), flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+            cleaned = re.sub(r"[\x00-\x1F]+", " ", cleaned)
+            json_start, json_end = cleaned.find("{"), cleaned.rfind("}") + 1
+            if json_start < 0 or json_end <= json_start:
+                raise ValueError("OpenAI response did not contain a JSON object")
+            data = json.loads(cleaned[json_start:json_end])
+            if not isinstance(data, dict) or not isinstance(data.get("sender"), dict) or not isinstance(data.get("receiver"), dict) or not isinstance(data.get("items"), list):
+                raise ValueError("OpenAI response did not match the required invoice JSON structure")
+            if not data["items"] and not data.get("invoice_number"):
+                raise ValueError("OpenAI response contained no invoice data")
+            return data
+
+        llm = ChatOpenAI(
+            model=model_name,
+            openai_api_key=openai_api_key,
+            temperature=0.1,
+            max_tokens=4000,
+            timeout=120,
+            max_retries=1,
         )
-        calculated_tax = _calculate_total_tax_from_tables(tables_data) or _extract_amount_below_table_header(
-            tables_data,
-            [r"tax\s+paid", r"total\s+tax"],
-        )
-        final_net_value = _extract_amount_below_table_header(
-            tables_data,
-            [r"net\s+value", r"net\s+payable"],
-        )
-        if calculated_goods_value is not None:
-            extracted_data["goods_value"] = float(calculated_goods_value)
-        if calculated_tax is not None:
-            extracted_data["tax_amount"] = float(calculated_tax)
-        if final_net_value is not None:
-            extracted_data["total_amount"] = float(final_net_value)
+        for attempt in range(3):
+            try:
+                response = llm.invoke([HumanMessage(content=prompt + extracted_text)])
+                invoice_json = validated_json(
+                    response.content if hasattr(response, "content") else str(response)
+                )
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                wait_time = 3 + (2 ** attempt)
+                logger.warning(
+                    "OpenAI invoice extraction attempt %s/3 failed for %s; retrying in %s seconds",
+                    attempt + 1, file_path, wait_time, exc_info=True,
+                )
+                time.sleep(wait_time)
 
-        extracted_data = enrich_invoice_fields(extracted_data, extracted_text, result.key_value_pairs)
+        def number(value):
+            if value in (None, ""):
+                return None
+            match = re.search(r"-?\d[\d,]*(?:\.\d+)?", str(value))
+            return float(match.group(0).replace(",", "")) if match else None
 
+        def gstin(value):
+            match = GSTIN_REGEX.search(str(value or ""))
+            return match.group(0).upper() if match else None
+
+        items = [item for item in invoice_json.get("items", []) if isinstance(item, dict)]
+        goods_values = [number(item.get("total_amount")) for item in items]
+        tax_values = [
+            sum(amount or 0 for amount in (
+                number(item.get("cgst_amount")), number(item.get("sgst_amount")), number(item.get("igst_amount"))
+            ))
+            for item in items
+        ]
+        total_values = [number(item.get("amount_after_tax")) for item in items]
+        line_goods_value = sum(value for value in goods_values if value is not None) if any(value is not None for value in goods_values) else None
+        line_tax_amount = sum(tax_values) if any(value is not None for value in [number(item.get(field)) for item in items for field in ("cgst_amount", "sgst_amount", "igst_amount")]) else None
+        line_total_amount = sum(value for value in total_values if value is not None) if any(value is not None for value in total_values) else None
+
+        goods_value = number(invoice_json.get("taxable_value"))
+        if goods_value is None:
+            goods_value = number(invoice_json.get("subtotal"))
+        if goods_value is None:
+            goods_value = line_goods_value
+
+        tax_amount = number(invoice_json.get("total_tax"))
+        if tax_amount is None:
+            invoice_tax_parts = [
+                number(invoice_json.get(field))
+                for field in ("total_cgst", "total_sgst", "total_igst")
+            ]
+            if any(value is not None for value in invoice_tax_parts):
+                tax_amount = sum(value or 0 for value in invoice_tax_parts)
+        if tax_amount is None:
+            tax_amount = line_tax_amount
+
+        total_amount = number(invoice_json.get("amount_due"))
+        if total_amount is None:
+            total_amount = number(invoice_json.get("invoice_total"))
+        if total_amount is None:
+            total_amount = line_total_amount
+
+        # Printed summary values must reconcile: taxable value + tax + other
+        # charges + round-off = final amount. This catches cases where the LLM
+        # captures only one tax-rate band (for example 2.5% but misses 9%).
+        other_charges = number(invoice_json.get("other_charges")) or 0
+        round_off = number(invoice_json.get("round_off")) or 0
+        if goods_value is not None and total_amount is not None:
+            derived_tax = total_amount - goods_value - other_charges - round_off
+            summary_is_inconsistent = (
+                tax_amount is None
+                or abs((goods_value + tax_amount + other_charges + round_off) - total_amount) > 0.01
+            )
+            if derived_tax >= 0 and summary_is_inconsistent:
+                tax_amount = round(derived_tax, 2)
+        if total_amount is None and goods_value is not None and tax_amount is not None:
+            total_amount = goods_value + tax_amount
+
+        sender = invoice_json.get("sender", {})
+        receiver = invoice_json.get("receiver", {})
+        vendor_gst_number = gstin(sender.get("gstin")) or _extract_gst_number(extracted_text, [r"\bvendor\b", r"\bsupplier\b", r"\bseller\b", r"\bfrom\b", r"\bconsignor\b", r"\bvendor gst\b", r"\bsupplier gst\b"])
+        vendor_gst_number = _recover_vendor_gst(extracted_text, vendor_gst_number)
+        customer_gst_number = gstin(receiver.get("gstin")) or _extract_gst_number(extracted_text, [r"\bcustomer\b", r"\bbuyer\b", r"\brecipient\b", r"\brcvr\b", r"\bbill to\b", r"\bship to\b", r"\bto\b", r"\broyal mart\b"])
+        customer_gst_number = _recover_store_gst(extracted_text, customer_gst_number)
+        vendor_name = _vendor_master_name(vendor_gst_number) or _clean_vendor_name(sender.get("name"))
+
+        date_value = str(invoice_json.get("date") or "")
+        date_match = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", date_value)
+        invoice_date = f"{date_match.group(3)}-{date_match.group(2).zfill(2)}-{date_match.group(1).zfill(2)}" if date_match else None
+        hsn_codes = []
+        for item in items:
+            code = _normalize_whitespace(item.get("hsn_sac"))
+            if code and code not in hsn_codes:
+                hsn_codes.append(code)
+        bank_name = _normalize_whitespace(invoice_json.get("bank_name"))
+        account_number = _clean_account_number(invoice_json.get("account_number"))
+        ifsc_code = _clean_ifsc(invoice_json.get("ifsc_code"))
+        bank_parts = [("Bank", bank_name), ("Account No", account_number), ("IFSC", ifsc_code)]
+
+        extracted_data = {
+            "invoice_number": _extract_invoice_number(
+                extracted_text,
+                invoice_json.get("invoice_number"),
+                file_path,
+            ),
+            "vendor_name": vendor_name,
+            "vendor_gst_number": vendor_gst_number,
+            "customer_gst_number": customer_gst_number,
+            "date": invoice_date,
+            "goods_value": goods_value,
+            "tax_amount": tax_amount,
+            "total_amount": total_amount,
+            "hsn_or_sac": ", ".join(hsn_codes) if hsn_codes else _extract_hsn_or_sac(extracted_text),
+            "bank_name": bank_name,
+            "account_number": account_number,
+            "ifsc_code": ifsc_code,
+            "vendor_bank": ", ".join(f"{label}: {value}" for label, value in bank_parts if value) or None,
+            "items": items,
+            "invoice_summary": {
+                key: invoice_json.get(key)
+                for key in (
+                    "taxable_value", "subtotal", "discount", "total_cgst",
+                    "total_sgst", "total_igst", "total_tax", "other_charges", "round_off",
+                    "invoice_total", "amount_due",
+                )
+                if invoice_json.get(key) not in (None, "")
+            },
+        }
+        extracted_data = enrich_invoice_fields(extracted_data, extracted_text)
         return extracted_data, extracted_text
     except Exception as e:
         logger.error(f"Error in OCR extraction for {file_path} using endpoint {endpoint}: {e}")
@@ -720,6 +1058,8 @@ def process_ocr_batch(batch_id, folder_path):
                 logger.info(f"⏳ [Batch {batch_id}] Processing file {index}/{total_in_folder}: {file_name}")
                 
                 document_result = None # Initialize document_result
+                extracted_data = None
+                extracted_text = None
                 try:
                     # Get next credential set in round-robin
                     credential = get_next_azure_credential()
@@ -767,6 +1107,21 @@ def process_ocr_batch(batch_id, folder_path):
                         document_result.reconciliation_status = ReconciliationStatus.MANUAL_REVIEW
                         document_result.reconciliation_details = {"error": str(file_e), "message": "Error during OCR or initial processing."}
                         document_result.save()
+                    else:
+                        # Keep failed files visible in the batch instead of
+                        # counting them as processed while silently dropping
+                        # them from the UI.
+                        DocumentResult.objects.create(
+                            batch=batch,
+                            original_filename=file_name,
+                            extracted_text=extracted_text,
+                            parsed_data=extracted_data or {},
+                            reconciliation_status=ReconciliationStatus.MANUAL_REVIEW,
+                            reconciliation_details={
+                                "error": str(file_e),
+                                "message": "OCR processing failed before reconciliation. Re-upload or retry this document.",
+                            },
+                        )
                     # Continue processing remaining files instead of failing the whole batch
                     batch.processed_files += 1
                     batch.save()

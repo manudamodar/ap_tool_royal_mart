@@ -41,6 +41,23 @@ def _normalize_invoice_no(value):
     return compact
 
 
+def _ocr_invoice_key(value):
+    """Return a conservative key for the common OCR confusion I <-> 1."""
+    normalized = _normalize_invoice_no(value)
+    return normalized.replace('I', '1') if normalized else None
+
+
+def _invoice_numbers_ocr_equivalent(left, right):
+    left_normalized = _normalize_invoice_no(left)
+    right_normalized = _normalize_invoice_no(right)
+    if not left_normalized or not right_normalized:
+        return False
+    return (
+        left_normalized == right_normalized
+        or _ocr_invoice_key(left_normalized) == _ocr_invoice_key(right_normalized)
+    )
+
+
 def _normalize_gst(value):
     text = _normalize_text(value)
     return text.upper() if text else None
@@ -117,13 +134,11 @@ def sync_due_report_invoice_reconciliation(document_result, matched_bill=None):
             break
 
     if not target_row:
-        target_row = invoice_candidates[0] if invoice_candidates else None
-
-    if not target_row:
         logger.warning(
-            "Could not locate invoice-wise row for document %s (invoice_no=%s)",
+            "Could not safely locate invoice-wise row for document %s (invoice_no=%s, gst_candidates=%s)",
             document_result.id,
             invoice_no,
+            gst_candidates,
         )
         return
 
@@ -160,6 +175,7 @@ def sync_due_report_invoice_reconciliation(document_result, matched_bill=None):
 def build_bill_lookup(fetched_bills):
     by_invoice = {}
     by_invoice_gst = {}
+    by_gst = {}
 
     for bill in fetched_bills:
         invoice_no = _normalize_invoice_no(bill.get("invoiceNo"))
@@ -173,9 +189,13 @@ def build_bill_lookup(fetched_bills):
         if invoice_no and gst_number:
             by_invoice_gst.setdefault((invoice_no, gst_number), []).append(bill)
 
+        if gst_number:
+            by_gst.setdefault(gst_number, []).append(bill)
+
     return {
         "by_invoice": by_invoice,
         "by_invoice_gst": by_invoice_gst,
+        "by_gst": by_gst,
     }
 
 
@@ -187,15 +207,49 @@ def match_bill(extracted_data, fetched_bills_lookup):
     gst_number = _normalize_gst(extracted_data.get("gst_number") or extracted_data.get("vendor_gst_number"))
     total_amount = extracted_data.get("total_amount")
 
-    if invoice_no and gst_number:
-        matched = fetched_bills_lookup["by_invoice_gst"].get((invoice_no, gst_number))
-        if matched:
-            return matched[0]
+    if not invoice_no:
+        return None
 
-    if invoice_no:
-        matched = fetched_bills_lookup["by_invoice"].get(invoice_no)
+    # Invoice number is the business lookup key. A unique exact invoice is
+    # considered found; GST and amounts are independent reconciliation checks
+    # that can send it to manual review without hiding the invoice match.
+    invoice_matches = fetched_bills_lookup["by_invoice"].get(invoice_no, [])
+    if len(invoice_matches) == 1:
+        return invoice_matches[0]
+
+    if len(invoice_matches) > 1:
+        # Same invoice number can exist for different vendors. Use GST first,
+        # then payable only to disambiguate; never select an arbitrary row.
+        gst_matches = [
+            bill for bill in invoice_matches
+            if gst_number and _normalize_gst(
+                bill.get("partyGSTNo") or bill.get("gst_number")
+                or bill.get("GSTIN") or bill.get("GST Number")
+            ) == gst_number
+        ]
+        if len(gst_matches) == 1:
+            return gst_matches[0]
+        candidates = gst_matches if gst_matches else invoice_matches
+        if total_amount not in (None, ''):
+            payable_matches = [
+                bill for bill in candidates
+                if _decimal_equal(total_amount, bill.get("payable"))
+            ]
+            return payable_matches[0] if len(payable_matches) == 1 else None
+        return None
+
+    # Guarded fallback for OCR confusion such as I/26-27/004198 being read as
+    # 1/26-27/004198. Exact GST and payable are both required, and ambiguity is
+    # rejected instead of choosing the first candidate.
+    if gst_number and total_amount not in (None, ''):
+        matched = [
+            bill
+            for bill in fetched_bills_lookup.get("by_gst", {}).get(gst_number, [])
+            if _invoice_numbers_ocr_equivalent(invoice_no, bill.get("invoiceNo"))
+            and _decimal_equal(total_amount, bill.get("payable"))
+        ]
         if matched:
-            return matched[0]
+            return matched[0] if len(matched) == 1 else None
 
     return None
 
@@ -235,7 +289,11 @@ def apply_reconciliation(document_result, extracted_data, matched_bill):
         expected_tax_type = _expected_tax_type(vendor_gst, customer_gst)
 
         checks = {
-            'invoice_number': _normalize_invoice_no(matched_bill.get('invoiceNo')) == invoice_no,
+            # Invoice, GST and payable are independent review flags. Fuzzy
+            # invoice matching was already guarded by GST + payable in
+            # match_bill(), so an amount discrepancy must not make an exact
+            # invoice number appear incorrect in the UI.
+            'invoice_number': _invoice_numbers_ocr_equivalent(matched_bill.get('invoiceNo'), invoice_no),
             'payable_amount': _decimal_equal(ocr_total_amount, api_payable_amount),
             'goods_value': _decimal_equal(extracted_data.get('goods_value'), matched_bill.get('goodsValue')),
             'tax_amount': _decimal_equal(extracted_data.get('tax_amount'), matched_bill.get('taxAmount')),
